@@ -1,0 +1,8 @@
+*~
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.dir-locals-2.el
+.DS_Store
+*.patch
+*.diff
