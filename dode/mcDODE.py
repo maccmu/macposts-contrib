@@ -383,11 +383,16 @@ class MCDODE():
             # num_assign_interval * num_e_link, num_assign_interval * num_e_path
             if os.path.exists(file_name):
                 # require pandas > 1.4 and pyarrow
-                dar_triplets = pd.read_csv(file_name, header=None, engine=engine, dtype={0: int, 1: int, 2: float})
-                car_dar = coo_matrix((dar_triplets[2], (dar_triplets[0], dar_triplets[1])), 
-                                    shape=(self.num_assign_interval * len(self.observed_links), self.num_assign_interval * len(self.paths_list)))
-                car_dar = car_dar.tocsr()
-                dar_triplets = None
+                try:
+                    dar_triplets = pd.read_csv(file_name, header=None, engine=engine, dtype={0: int, 1: int, 2: float})
+                except pd.errors.EmptyDataError:
+                    car_dar = csr_matrix((self.num_assign_interval * len(self.observed_links), self.num_assign_interval * len(self.paths_list)))
+                else:
+                    car_dar = coo_matrix((dar_triplets[2], (dar_triplets[0], dar_triplets[1])), 
+                                        shape=(self.num_assign_interval * len(self.observed_links), self.num_assign_interval * len(self.paths_list)))
+                    car_dar = car_dar.tocsr()
+                    dar_triplets = None
+
                 os.remove(file_name)
                 if car_dar.max() == 0.:
                     print("car_dar is empty!")
@@ -405,11 +410,16 @@ class MCDODE():
             # num_assign_interval * num_e_link, num_assign_interval * num_e_path
             if os.path.exists(file_name):
                 # require pandas > 1.4 and pyarrow
-                dar_triplets = pd.read_csv(file_name, header=None, engine=engine, dtype={0: int, 1: int, 2: float})
-                truck_dar = coo_matrix((dar_triplets[2], (dar_triplets[0], dar_triplets[1])), 
-                                      shape=(self.num_assign_interval * len(self.observed_links), self.num_assign_interval * len(self.paths_list)))
-                truck_dar = truck_dar.tocsr()
-                dar_triplets = None
+                try:
+                    dar_triplets = pd.read_csv(file_name, header=None, engine=engine, dtype={0: int, 1: int, 2: float})
+                except pd.errors.EmptyDataError:
+                    truck_dar = csr_matrix((self.num_assign_interval * len(self.observed_links), self.num_assign_interval * len(self.paths_list)))
+                else:
+                    truck_dar = coo_matrix((dar_triplets[2], (dar_triplets[0], dar_triplets[1])), 
+                                        shape=(self.num_assign_interval * len(self.observed_links), self.num_assign_interval * len(self.paths_list)))
+                    truck_dar = truck_dar.tocsr()
+                    dar_triplets = None
+                    
                 os.remove(file_name)
                 if truck_dar.max() == 0.:
                     print("truck_dar is empty!")
