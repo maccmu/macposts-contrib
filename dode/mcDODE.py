@@ -722,6 +722,10 @@ class MCDODE():
             f_car_grad += self.config['origin_vehicle_registration_weight'] * f_car_grad_add
             f_truck_grad += self.config['origin_vehicle_registration_weight'] * f_truck_grad_add
 
+        if 'regularization_weight' in self.config:
+            f_car_grad += self.config['regularization_weight'] * f_car
+            f_truck_grad += self.config['regularization_weight'] * f_truck
+
         # print("Getting Loss", time.time())
         total_loss, loss_dict = self._get_loss(one_data_dict, dta, f_car, f_truck)
         return f_car_grad, f_truck_grad, total_loss, loss_dict, dta, x_e_car, x_e_truck, tt_e_car, tt_e_truck, O_demand_est
