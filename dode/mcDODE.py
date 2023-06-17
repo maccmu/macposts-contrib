@@ -618,9 +618,11 @@ class MCDODE():
                 print("car_ltg_matrix is empty!")
             
         if self.config['use_truck_link_tt']:
-            truck_ltg_matrix = self._compute_link_tt_grad_on_path_flow_truck(dta)
-            if truck_ltg_matrix.max() == 0.:
-                print("truck_ltg_matrix is empty!")
+            pass
+            # TODO: issue
+            # truck_ltg_matrix = self._compute_link_tt_grad_on_path_flow_truck(dta)
+            # if truck_ltg_matrix.max() == 0.:
+            #     print("truck_ltg_matrix is empty!")
 
         return car_ltg_matrix, truck_ltg_matrix
 
@@ -2168,7 +2170,7 @@ class PostProcessing:
         # plt.ylim([0, 1])
         plt.xlim([1, len(loss_list)])
 
-        plt.savefig(os.path.join(self.result_folder, fig_name))
+        plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
         plt.show()
 
@@ -2214,7 +2216,7 @@ class PostProcessing:
             plt.ylim([0, 1.1])
             plt.xlim([1, len(loss_list)])
 
-            plt.savefig(os.path.join(self.result_folder, fig_name))
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
 
@@ -2357,10 +2359,8 @@ class PostProcessing:
 
     def scatter_plot_count(self, fig_name =  'link_flow_scatterplot_pathflow.png'):
         if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data']:
-
-            fig, axes = plt.subplots(1,
-                                    self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data'], 
-                                    figsize=(36, 9), dpi=300, squeeze=False)
+            n = self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data']
+            fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
 
             i = 0
 
@@ -2373,6 +2373,7 @@ class PostProcessing:
                 axes[0, i].set_xlabel('True observed flow for car')
                 axes[0, i].set_xlim([0, m_car_max])
                 axes[0, i].set_ylim([0, m_car_max])
+                axes[0, i].set_box_aspect(1)
                 axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_car_count),
                             horizontalalignment='left',
                             verticalalignment='top',
@@ -2389,6 +2390,7 @@ class PostProcessing:
                 axes[0, i].set_xlabel('True observed flow for truck')
                 axes[0, i].set_xlim([0, m_truck_max])
                 axes[0, i].set_ylim([0, m_truck_max])
+                axes[0, i].set_box_aspect(1)
                 axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_truck_count),
                             horizontalalignment='left',
                             verticalalignment='top',
@@ -2404,12 +2406,13 @@ class PostProcessing:
                 axes[0, i].set_xlabel('True origin vehicle registration count')
                 axes[0, i].set_xlim([0, m_max])
                 axes[0, i].set_ylim([0, m_max])
+                axes[0, i].set_box_aspect(1)
                 axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_origin_vehicle_registration),
                             horizontalalignment='left',
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
 
-            plt.savefig(os.path.join(self.result_folder, fig_name))
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
 
@@ -2471,10 +2474,8 @@ class PostProcessing:
 
     def scatter_plot_cost(self, fig_name = 'link_cost_scatterplot_pathflow.png'):
         if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
-
-            fig, axes = plt.subplots(1, 
-                                    self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt'], 
-                                    figsize=(36, 9), dpi=300, squeeze=False)
+            n = self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']
+            fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
             
             i = 0
 
@@ -2489,6 +2490,7 @@ class PostProcessing:
                 axes[0, i].set_xlabel('True observed travel cost for car')
                 axes[0, i].set_xlim([car_tt_min, car_tt_max])
                 axes[0, i].set_ylim([car_tt_min, car_tt_max])
+                axes[0, i].set_box_aspect(1)
                 axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_car_cost),
                             horizontalalignment='left',
                             verticalalignment='top',
@@ -2507,22 +2509,21 @@ class PostProcessing:
                 axes[0, i].set_xlabel('True observed travel cost for truck')
                 axes[0, i].set_xlim([truck_tt_min, truck_tt_max])
                 axes[0, i].set_ylim([truck_tt_min, truck_tt_max])
+                axes[0, i].set_box_aspect(1)
                 axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_truck_cost),
                             horizontalalignment='left',
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
 
-            plt.savefig(os.path.join(self.result_folder, fig_name))
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
 
     def scatter_plot_speed(self, fig_name = 'link_speed_scatterplot_pathflow.png'):
 
         if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
-
-            fig, axes = plt.subplots(1, 
-                                    self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt'], 
-                                    figsize=(36, 9), dpi=300, squeeze=False)
+            n = self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']
+            fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
             
             i = 0
 
@@ -2539,6 +2540,7 @@ class PostProcessing:
                 axes[0, i].set_xlabel('True observed link speed for car')
                 axes[0, i].set_xlim([car_speed_min, car_speed_max])
                 axes[0, i].set_ylim([car_speed_min, car_speed_max])
+                axes[0, i].set_box_aspect(1)
                 axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_car_speed),
                             horizontalalignment='left',
                             verticalalignment='top',
@@ -2559,11 +2561,12 @@ class PostProcessing:
                 axes[0, i].set_xlabel('True observed link speed for truck')
                 axes[0, i].set_xlim([truck_speed_min, truck_speed_max])
                 axes[0, i].set_ylim([truck_speed_min, truck_speed_max])
+                axes[0, i].set_box_aspect(1)
                 axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_truck_speed),
                             horizontalalignment='left',
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
 
-            plt.savefig(os.path.join(self.result_folder, fig_name))
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
