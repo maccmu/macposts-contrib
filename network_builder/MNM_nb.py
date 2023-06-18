@@ -438,12 +438,14 @@ class MNM_config():
       'num_of_O': int, 
       'num_of_D': int, 
       'OD_pair': int,
+      'multi_OD_seq': int,
       'routing_type' : str,
       'adaptive_ratio': float,
       'init_demand_split': int, 
       'num_of_tolled_link': int, 
       'num_of_vehicle_labels': int,
       'ev_label': int,
+      'num_of_charging_station': int,
 
       # STAT
       'rec_mode': str, 
