@@ -2330,6 +2330,8 @@ class MMDODE:
                 best_f_car_driving, best_f_truck_driving, best_f_passenger_bustransit, best_f_car_pnr, best_f_bus, \
                 best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus \
                     = pickle.load(open(use_file_as_init, 'rb'))
+        
+        assert((len(loss_list) >= best_epoch) and (starting_epoch >= best_epoch))
 
         pathflow_solver = torch_pathflow_solver(self.num_assign_interval, self.num_path_driving, self.num_path_bustransit, self.num_path_pnr, self.num_path_busroute,
                                                 car_driving_scale, truck_driving_scale, passenger_bustransit_scale, car_pnr_scale, bus_scale,
@@ -2569,6 +2571,8 @@ class MMDODE:
         else:
             f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus = \
                 self.init_path_flow(car_driving_scale, truck_driving_scale, passenger_bustransit_scale, car_pnr_scale, bus_scale)
+            
+        assert((len(loss_list) >= best_epoch) and (starting_epoch >= best_epoch))
            
         # fixed bus path flow
         if fix_bus:
