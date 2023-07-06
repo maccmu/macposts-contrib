@@ -230,6 +230,16 @@ class MCDODE():
 
         self.num_procs = num_procs
 
+    def get_registered_links_coverage_by_registered_paths(self, folder):
+        a = macposts.mcdta_api()
+        a.initialize(folder)
+        a.register_links(self.observed_links)
+        a.register_paths(self.paths_list)
+
+        link_coverage = a.get_registered_links_coverage_in_registered_paths()
+        assert((link_coverage.shape[0] == len(self.paths_list)) & (link_coverage.shape[1] == len(self.observed_links)))
+        return link_coverage
+
     def check_registered_links_covered_by_registered_paths(self, folder, add=False):
         self.save_simulation_input_files(folder)
 
@@ -251,6 +261,15 @@ class MCDODE():
             else:
                 is_updated = 0
         return is_updated, is_driving_link_covered
+    
+    def generate_paths_to_cover_links(self, folder, links, max_iter):
+        self.save_simulation_input_files(folder)
+        a = macposts.mcdta_api()
+        a.initialize(folder)
+        a.register_links(self.observed_links)
+        a.register_paths(self.paths_list)
+        related_paths_added = a.generate_paths_to_cover_links(links, max_iter)
+        return related_paths_added
 
     def _add_car_link_flow_data(self, link_flow_df_list):
         # assert (self.config['use_car_link_flow'])
@@ -628,7 +647,14 @@ class MCDODE():
 
     def init_demand_vector(self, num_assign_interval, num_col, scale=1):
         # uniform
-        d = np.random.rand(num_assign_interval * num_col) * scale
+        if type(scale) == np.ndarray:
+            if scale.ndim == 1:
+                assert(len(scale) == num_col)
+                scale = scale[np.newaxis, :]
+            else:
+                assert((scale.shape[0] == 1) & (scale.shape[1] == num_col))
+        d = np.random.rand(num_assign_interval, num_col) * scale
+        d = d.flatten(order='C')
 
         # Kaiming initialization (not working)
         # d = np.random.normal(0, 1, num_assign_interval * num_col) * scale
@@ -642,9 +668,52 @@ class MCDODE():
         return d
 
     def init_path_flow(self, car_scale=1, truck_scale=0.1):
+        if car_scale is None or truck_scale is None:
+            car_scale, truck_scale = self.estimate_path_flow_scale()
+
         f_car = self.init_demand_vector(self.num_assign_interval, self.num_path, car_scale) 
         f_truck = self.init_demand_vector(self.num_assign_interval, self.num_path, truck_scale) 
         return f_car, f_truck
+    
+    def estimate_path_flow_scale(self):
+        # link_coverage = self.nb.get_link_coverage(self.observed_links, self.nb.folder_path, graph_file_name='Snap_graph', pathtable_file_name='path_table')
+        link_coverage = self.get_registered_links_coverage_by_registered_paths(self.nb.folder_path)
+        assert(link_coverage.shape[0] == len(self.paths_list))
+        num_links = len(self.observed_links)
+        # assume only one data point exists and no link aggregation
+        one_data_dict = self._get_one_data(0)
+
+        m_car = one_data_dict['car_link_flow']
+        m_truck = one_data_dict['truck_link_flow']
+        # link_mask = one_data_dict['mask_driving_link'][:num_links]
+        
+        m_car = m_car.reshape(-1, num_links) 
+        m_truck = m_truck.reshape(-1, num_links) 
+
+        m_car_avg = np.nanmedian(m_car, axis=0, keepdims=True)
+        m_truck_avg = np.nanmedian(m_truck, axis=0, keepdims=True)
+
+        car_scale = link_coverage.astype(float)/link_coverage.sum(axis=0, keepdims=True)*m_car_avg
+        truck_scale = link_coverage.astype(float)/link_coverage.sum(axis=0, keepdims=True)*m_truck_avg
+
+        car_scale = np.nanmax(car_scale, axis=1)
+        truck_scale = np.nanmax(truck_scale, axis=1)
+
+        car_scale = np.nan_to_num(car_scale)
+        truck_scale = np.nan_to_num(truck_scale)
+
+        car_scale = np.maximum(car_scale, 1.2)
+        truck_scale = np.maximum(truck_scale, 1.2)
+
+        car_scale = car_scale / self.nb.config.config_dict['DTA']['flow_scalar'] 
+        truck_scale = truck_scale / self.nb.config.config_dict['DTA']['flow_scalar'] 
+
+        return car_scale, truck_scale
+
+        # f_car = np.random.rand(self.num_assign_interval, len(self.paths_list)) * car_scale[np.newaxis, :]
+        # f_truck = np.random.rand(self.num_assign_interval, len(self.paths_list)) * truck_scale[np.newaxis, :]
+        # f_car, f_truck = f_car.flatten(order='C'), f_truck.flatten(order='C')
+        # return f_car, f_truck
 
     def compute_path_flow_grad_and_loss(self, one_data_dict, f_car, f_truck, counter=0):
         # print("Running simulation", time.time())
@@ -2579,25 +2648,26 @@ class PostProcessing:
 
             plt.show()
 
-    def scatter_plot_count_by_link(self, fig_name =  'link_flow_scatterplot_pathflow_by_link'):
+    def scatter_plot_count_by_link(self, link_list=None, fig_name =  'link_flow_scatterplot_pathflow_by_link'):
         if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow']:
-            num_links = len(self.dode.observed_links)
+            if link_list is None:
+                link_list = self.dode.observed_links
             if self.dode.config['use_car_link_flow']:
-                true_car_count = self.true_car_count.reshape(-1, num_links) 
-                estimated_car_count = self.estimated_car_count.reshape(-1, num_links) 
+                true_car_count = self.true_car_count.reshape(self.dode.num_assign_interval, -1) 
+                estimated_car_count = self.estimated_car_count.reshape(self.dode.num_assign_interval, -1) 
             if self.dode.config['use_truck_link_flow']:
-                true_truck_count = self.true_truck_count.reshape(-1, num_links) 
-                estimated_truck_count = self.estimated_truck_count.reshape(-1, num_links) 
+                true_truck_count = self.true_truck_count.reshape(self.dode.num_assign_interval, -1) 
+                estimated_truck_count = self.estimated_truck_count.reshape(self.dode.num_assign_interval, -1) 
 
             n = self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow']
 
-            for li, link in enumerate(self.dode.observed_links):
+            for li, link in enumerate(link_list):
                 fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
                 i = 0
                 
                 if self.dode.config['use_car_link_flow']:
-                    link_true_car_count = true_car_count[:, li]
-                    link_estimated_car_count = estimated_car_count[:, li]
+                    link_true_car_count = true_car_count[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
+                    link_estimated_car_count = estimated_car_count[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
                     ind = ~(np.isinf(link_true_car_count) + np.isinf(link_estimated_car_count) + np.isnan(link_true_car_count) + np.isnan(link_estimated_car_count))
                     m_car_max = int(np.max((np.max(link_true_car_count[ind]), np.max(link_estimated_car_count[ind]))) + 1) if any(ind) else 20
                     axes[0, i].scatter(link_true_car_count[ind], link_estimated_car_count[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
@@ -2615,8 +2685,8 @@ class PostProcessing:
                 i += self.dode.config['use_car_link_flow']
 
                 if self.dode.config['use_truck_link_flow']:
-                    link_true_truck_count = true_truck_count[:, li]
-                    link_estimated_truck_count = estimated_truck_count[:, li]
+                    link_true_truck_count = true_truck_count[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
+                    link_estimated_truck_count = estimated_truck_count[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
                     ind = ~(np.isinf(link_true_truck_count) + np.isinf(link_estimated_truck_count) + np.isnan(link_true_truck_count) + np.isnan(link_estimated_truck_count))
                     m_truck_max = int(np.max((np.max(link_true_truck_count[ind]), np.max(link_estimated_truck_count[ind]))) + 1) if any(ind) else 20
                     axes[0, i].scatter(link_true_truck_count[ind], link_estimated_truck_count[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
@@ -2738,25 +2808,26 @@ class PostProcessing:
 
             plt.show()
 
-    def scatter_plot_cost_by_link(self, fig_name = 'link_cost_scatterplot_pathflow_by_link'):
+    def scatter_plot_cost_by_link(self, link_list = None, fig_name = 'link_cost_scatterplot_pathflow_by_link'):
         if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
-            num_links = len(self.dode.observed_links)
+            if link_list is None:
+                link_list = self.dode.observed_links
             if self.dode.config['use_car_link_tt']:
-                true_car_cost = self.true_car_cost.reshape(-1, num_links) 
-                estimated_car_cost = self.estimated_car_cost.reshape(-1, num_links) 
+                true_car_cost = self.true_car_cost.reshape(self.dode.num_assign_interval, -1) 
+                estimated_car_cost = self.estimated_car_cost.reshape(self.dode.num_assign_interval, -1) 
             if self.dode.config['use_truck_link_tt']:
-                true_truck_cost = self.true_truck_cost.reshape(-1, num_links) 
-                estimated_truck_cost = self.estimated_truck_cost.reshape(-1, num_links) 
+                true_truck_cost = self.true_truck_cost.reshape(self.dode.num_assign_interval, -1) 
+                estimated_truck_cost = self.estimated_truck_cost.reshape(self.dode.num_assign_interval, -1) 
 
             n = self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']
             
-            for li, link in enumerate(self.dode.observed_links):
+            for li, link in enumerate(link_list):
                 fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
                 i = 0
 
                 if self.dode.config['use_car_link_tt']:
-                    link_true_car_cost = true_car_cost[:, li]
-                    link_estimated_car_cost = estimated_car_cost[:, li]
+                    link_true_car_cost = true_car_cost[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
+                    link_estimated_car_cost = estimated_car_cost[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
                     ind = ~(np.isinf(link_true_car_cost) + np.isinf(link_estimated_car_cost) + np.isnan(link_true_car_cost) + np.isnan(link_estimated_car_cost))
                     car_tt_min = np.min((np.min(link_true_car_cost[ind]), np.min(link_estimated_car_cost[ind]))) - 1 if any(ind) else 0
                     car_tt_max = np.max((np.max(link_true_car_cost[ind]), np.max(link_estimated_car_cost[ind]))) + 1 if any(ind) else 80
@@ -2775,8 +2846,8 @@ class PostProcessing:
                 i += self.dode.config['use_car_link_tt']
 
                 if self.dode.config['use_truck_link_tt']:
-                    link_true_truck_cost = true_truck_cost[:, li]
-                    link_estimated_truck_cost = estimated_truck_cost[:, li]
+                    link_true_truck_cost = true_truck_cost[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
+                    link_estimated_truck_cost = estimated_truck_cost[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
                     ind = ~(np.isinf(link_true_truck_cost) + np.isinf(link_estimated_truck_cost) + np.isnan(link_true_truck_cost) + np.isnan(link_estimated_truck_cost))
                     truck_tt_min = np.min((np.min(link_true_truck_cost[ind]), np.min(link_estimated_truck_cost[ind]))) - 1 if any(ind) else 0
                     truck_tt_max = np.max((np.max(link_true_truck_cost[ind]), np.max(link_estimated_truck_cost[ind]))) + 1 if any(ind) else 80
