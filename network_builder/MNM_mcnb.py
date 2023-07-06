@@ -735,6 +735,18 @@ class MNM_network_builder():
             if link.ID == ID:
                 return link
         return None
+    
+    def get_link_coverage(self, link_list, path, graph_file_name='Snap_graph', pathtable_file_name='path_table'):
+        graph = pd.read_csv(os.path.join(path, graph_file_name), sep=' ', skiprows=1, header=None)
+        f = open(os.path.join(path, pathtable_file_name), 'r')
+        path_table = f.readlines()
+        f.close()
+        link_coverage = np.zeros((len(path_table), len(link_list)), dtype=int)
+        for i, path in enumerate(path_table):
+            path_nodes = [int(x) for x in path.strip().split(' ')]
+            path_links = [graph.loc[(graph.loc[:, 1] == path_nodes[j]) & (graph.loc[:, 2] == path_nodes[j+1]), 0].values[0] for j in range(len(path_nodes)-1)]
+            link_coverage[i, :] = np.array([int(observed_link in path_links) for observed_link in link_list])
+        return link_coverage
 
     def load_from_folder(self, path, config_file_name='config.conf',
                          link_file_name='MNM_input_link', node_file_name='MNM_input_node',
