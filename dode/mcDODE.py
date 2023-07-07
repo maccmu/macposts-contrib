@@ -646,14 +646,18 @@ class MCDODE():
         return car_ltg_matrix, truck_ltg_matrix
 
     def init_demand_vector(self, num_assign_interval, num_col, scale=1):
-        # uniform
+        
         if type(scale) == np.ndarray:
             if scale.ndim == 1:
                 assert(len(scale) == num_col)
                 scale = scale[np.newaxis, :]
             else:
                 assert((scale.shape[0] == 1) & (scale.shape[1] == num_col))
+        # uniform
         d = np.random.rand(num_assign_interval, num_col) * scale
+        # normal
+        # d = np.random.normal(0, 1, (num_assign_interval, num_col)) * 0.1 * scale + scale
+
         d = d.flatten(order='C')
 
         # Kaiming initialization (not working)
@@ -673,6 +677,9 @@ class MCDODE():
 
         f_car = self.init_demand_vector(self.num_assign_interval, self.num_path, car_scale) 
         f_truck = self.init_demand_vector(self.num_assign_interval, self.num_path, truck_scale) 
+
+        f_car = np.maximum(f_car, 1e-6)
+        f_truck = np.maximum(f_truck, 1e-6)
         return f_car, f_truck
     
     def estimate_path_flow_scale(self):
@@ -690,8 +697,11 @@ class MCDODE():
         m_car = m_car.reshape(-1, num_links) 
         m_truck = m_truck.reshape(-1, num_links) 
 
-        m_car_avg = np.nanmedian(m_car, axis=0, keepdims=True)
-        m_truck_avg = np.nanmedian(m_truck, axis=0, keepdims=True)
+        # m_car_avg = np.nanmedian(m_car, axis=0, keepdims=True)
+        # m_truck_avg = np.nanmedian(m_truck, axis=0, keepdims=True)
+
+        m_car_avg = np.nanmax(m_car, axis=0, keepdims=True)
+        m_truck_avg = np.nanmax(m_truck, axis=0, keepdims=True)
 
         car_scale = link_coverage.astype(float)/link_coverage.sum(axis=0, keepdims=True)*m_car_avg
         truck_scale = link_coverage.astype(float)/link_coverage.sum(axis=0, keepdims=True)*m_truck_avg
