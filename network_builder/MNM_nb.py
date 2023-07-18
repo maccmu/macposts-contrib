@@ -447,6 +447,10 @@ class MNM_config():
       'ev_label': int,
       'num_of_charging_station': int,
 
+      'EV_starting_range_roadside_charging': float,
+      'EV_starting_range_non_roadside_charging': float,
+      'EV_full_range': float,
+
       # STAT
       'rec_mode': str, 
       'rec_mode_para': str, 
