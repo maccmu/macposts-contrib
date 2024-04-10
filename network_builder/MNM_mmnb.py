@@ -1397,6 +1397,8 @@ class MNM_network_builder():
 
         self.emission_link_array = None
 
+        self.link_toll_df = None
+
     def set_network_driving_name(self, name):
         self.network_driving_name = name
 
