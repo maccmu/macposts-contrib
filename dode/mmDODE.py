@@ -15,6 +15,10 @@ import torch
 import torch.nn as nn
 import pandas as pd
 # from sklearn.metrics import r2_score
+import re
+matches = [s for s in plt.style.available if re.search(r"seaborn.*poster", s)]
+assert(len(matches) > 0)
+plt_style = matches[0]
 
 import macposts
 
@@ -3793,8 +3797,8 @@ class PostProcessing:
         plt.rc('legend', fontsize=20)    # legend fontsize
         plt.rc('figure', titlesize=20)   # fontsize of the figure title
 
-        sns.set()
-        plt.style.use('seaborn-poster')
+        sns.set_theme()
+        plt.style.use(plt_style)
 
     def plot_total_loss(self, loss_list, fig_name = 'total_loss_pathflow.png'):
 
