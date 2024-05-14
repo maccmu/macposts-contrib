@@ -75,7 +75,8 @@ class torch_pathflow_solver(nn.Module):
         if use_file_as_init is not None:
             # log f numpy
             _, _, _, _, log_f_car_driving, log_f_truck_driving, log_f_passenger_bustransit, log_f_car_pnr, log_f_bus,\
-                _, _, _, _, _ = pickle.load(open(use_file_as_init, 'rb'))
+                _, _, _, _, _, \
+                     _, _, _, _, _, _, _, _ = pickle.load(open(use_file_as_init, 'rb'))
 
         if log_f_car_driving is None:
             self.log_f_car_driving = nn.Parameter(self.init_tensor(torch.Tensor(self.num_assign_interval * self.num_path_driving, 1)).squeeze(), requires_grad=True)
@@ -151,24 +152,24 @@ class torch_pathflow_solver(nn.Module):
             self.log_f_car_pnr = nn.Parameter(self.log_f_car_pnr.reshape(-1))
 
     def generate_pathflow_tensor(self):
-        # exp
-        f_car_driving = torch.exp(self.log_f_car_driving * self.car_driving_scale)
-        f_truck_driving = torch.exp(self.log_f_truck_driving * self.truck_driving_scale)
-        f_passenger_bustransit = torch.exp(self.log_f_passenger_bustransit * self.passenger_bustransit_scale)
-        f_car_pnr = torch.exp(self.log_f_car_pnr * self.car_pnr_scale)
+        # softplus
+        f_car_driving = torch.nn.functional.softplus(self.log_f_car_driving) * self.car_driving_scale
+        f_truck_driving = torch.nn.functional.softplus(self.log_f_truck_driving) * self.truck_driving_scale
+        f_passenger_bustransit = torch.nn.functional.softplus(self.log_f_passenger_bustransit) * self.passenger_bustransit_scale
+        f_car_pnr = torch.nn.functional.softplus(self.log_f_car_pnr) * self.car_pnr_scale
         if (not self.fix_bus) and (self.log_f_bus is not None):
-            f_bus = torch.exp(self.log_f_bus * self.bus_scale)
+            f_bus = torch.nn.functional.softplus(self.log_f_bus) * self.bus_scale
         else:
             f_bus = None
 
-        f_car_driving = torch.clamp(f_car_driving, max=5e3)
-        f_truck_driving = torch.clamp(f_truck_driving, max=5e3)
-        f_passenger_bustransit = torch.clamp(f_passenger_bustransit, max=1e3)
-        f_car_pnr = torch.clamp(f_car_pnr, max=3e3)
-        if (not self.fix_bus) and (f_bus is not None):
-            f_bus = torch.clamp(f_bus, max=1e1)
-        else:
-            f_bus = None
+        # f_car_driving = torch.clamp(f_car_driving, max=5e3)
+        # f_truck_driving = torch.clamp(f_truck_driving, max=5e3)
+        # f_passenger_bustransit = torch.clamp(f_passenger_bustransit, max=1e3)
+        # f_car_pnr = torch.clamp(f_car_pnr, max=3e3)
+        # if (not self.fix_bus) and (f_bus is not None):
+        #     f_bus = torch.clamp(f_bus, max=1e1)
+        # else:
+        #     f_bus = None
 
         # relu
         # f_car_driving = torch.clamp(self.log_f_car_driving * self.car_driving_scale, min=1e-6)
@@ -328,7 +329,7 @@ class MMDODE:
 
 
     def check_registered_links_covered_by_registered_paths(self, folder, add=False):
-        self.save_simulation_input_files(folder)
+        self.save_simulation_input_files(folder, explicit_bus=0, historical_bus_waiting_time=0)
 
         a = macposts.mmdta_api()
         a.initialize(folder)
@@ -445,7 +446,8 @@ class MMDODE:
             self.data_dict['mask_walking_link'] = np.ones(len(self.observed_links_walking) * self.num_assign_interval, dtype=bool)
 
     def save_simulation_input_files(self, folder_path, f_car_driving=None, f_truck_driving=None, 
-                                    f_passenger_bustransit=None, f_car_pnr=None, f_bus=None):
+                                    f_passenger_bustransit=None, f_car_pnr=None, f_bus=None, 
+                                    explicit_bus=0, historical_bus_waiting_time=0):
 
         if not os.path.exists(folder_path):
             os.mkdir(folder_path)
@@ -484,10 +486,19 @@ class MMDODE:
         self.nb.config.config_dict['STAT']['tt_load_automatic_rec'] = 0
         self.nb.config.config_dict['STAT']['tt_record_automatic_rec'] = 0
 
+        # TODO: to estimate passenger transit flow,
+        #       currently use explicit_bus = 0 and historical_bus_waiting_time = 0 for DODE
+        # explicit_bus = 1 model bus vehcile explicitly in DNL, 0 otherwise
+        # historical_bus_waiting_time = waiting time in number of unit intervals (5s)
+        # estimating passenger flow is difficult, this is a temporary solution
+        self.nb.config.config_dict['DTA']['explicit_bus'] = explicit_bus
+        self.nb.config.config_dict['DTA']['historical_bus_waiting_time'] = historical_bus_waiting_time
+
         self.nb.dump_to_folder(folder_path)
         
 
-    def _run_simulation(self, f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus, counter=0, run_mmdta_adaptive=True, show_loading=False):
+    def _run_simulation(self, f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus, counter=0, run_mmdta_adaptive=True, show_loading=False,
+                        explicit_bus=0, historical_bus_waiting_time=0):
         # print("Start simulation", time.time())
         hash1 = hashlib.sha1()
         # python 2
@@ -496,7 +507,8 @@ class MMDODE:
         hash1.update((str(time.time()) + str(counter)).encode('utf-8'))
         new_folder = str(hash1.hexdigest())
 
-        self.save_simulation_input_files(new_folder, f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus)
+        self.save_simulation_input_files(new_folder, f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus,
+                                         explicit_bus=explicit_bus, historical_bus_waiting_time=historical_bus_waiting_time)
 
         a = macposts.mmdta_api()
         a.initialize(new_folder)
@@ -919,7 +931,8 @@ class MMDODE:
     def compute_path_flow_grad_and_loss(self, one_data_dict, f_car_driving, f_truck_driving, 
                                         f_passenger_bustransit, f_car_pnr, f_bus, fix_bus=True, counter=0, run_mmdta_adaptive=True):
         # print("Running simulation", time.time())
-        dta = self._run_simulation(f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus, counter, run_mmdta_adaptive, False)
+        dta = self._run_simulation(f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus, counter, run_mmdta_adaptive, show_loading=False,
+                                   explicit_bus=0, historical_bus_waiting_time=0)
 
         if self.config['use_car_link_tt'] or self.config['use_truck_link_tt'] or self.config['use_passenger_link_tt'] or self.config['use_bus_link_tt']:
             dta.build_link_cost_map(True)
@@ -2080,8 +2093,8 @@ class MMDODE:
             if self.config['car_count_agg']:
                 x_e = one_data_dict['car_count_agg_L'].dot(x_e)
 
-            loss = self.config['link_car_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_driving_link']] - one_data_dict['car_link_flow'][one_data_dict['mask_driving_link']]))
-            # loss = np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_driving_link']] - one_data_dict['car_link_flow'][one_data_dict['mask_driving_link']]))
+            # loss = self.config['link_car_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_driving_link']] - one_data_dict['car_link_flow'][one_data_dict['mask_driving_link']]))
+            loss = np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_driving_link']] - one_data_dict['car_link_flow'][one_data_dict['mask_driving_link']]))
             loss_dict['car_count_loss'] = loss
 
         if self.config['use_truck_link_flow'] or self.config['compute_truck_link_flow_loss']:
@@ -2090,8 +2103,8 @@ class MMDODE:
             assert(len(x_e) == len(self.observed_links_driving) * self.num_assign_interval)
             if self.config['truck_count_agg']:
                 x_e = one_data_dict['truck_count_agg_L'].dot(x_e)
-            loss = self.config['link_truck_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_driving_link']] - one_data_dict['truck_link_flow'][one_data_dict['mask_driving_link']]))
-            # loss = np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_driving_link']] - one_data_dict['truck_link_flow'][one_data_dict['mask_driving_link']]))
+            # loss = self.config['link_truck_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_driving_link']] - one_data_dict['truck_link_flow'][one_data_dict['mask_driving_link']]))
+            loss = np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_driving_link']] - one_data_dict['truck_link_flow'][one_data_dict['mask_driving_link']]))
             loss_dict['truck_count_loss'] = loss
 
         if self.config['use_bus_link_flow'] or self.config['compute_bus_link_flow_loss']:
@@ -2100,8 +2113,8 @@ class MMDODE:
             assert(len(x_e) == len(self.observed_links_bus) * self.num_assign_interval)
             if self.config['bus_count_agg']:
                 x_e = one_data_dict['bus_count_agg_L'].dot(x_e)
-            loss = self.config['link_bus_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_bus_link']] - one_data_dict['bus_link_flow'][one_data_dict['mask_bus_link']]))
-            # loss = np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_bus_link']] - one_data_dict['bus_link_flow'][one_data_dict['mask_bus_link']]))
+            # loss = self.config['link_bus_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_bus_link']] - one_data_dict['bus_link_flow'][one_data_dict['mask_bus_link']]))
+            loss = np.linalg.norm(np.nan_to_num(x_e[one_data_dict['mask_bus_link']] - one_data_dict['bus_link_flow'][one_data_dict['mask_bus_link']]))
             loss_dict['bus_count_loss'] = loss
 
         if self.config['use_passenger_link_flow'] or self.config['compute_passenger_link_flow_loss']:
@@ -2124,8 +2137,8 @@ class MMDODE:
             else:
                 mask_passenger = one_data_dict['mask_bus_link']
 
-            loss = self.config['link_passenger_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[mask_passenger] - one_data_dict['passenger_link_flow'][mask_passenger]))
-            # loss = np.linalg.norm(np.nan_to_num(x_e[mask_passenger] - one_data_dict['passenger_link_flow'][mask_passenger]))
+            # loss = self.config['link_passenger_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[mask_passenger] - one_data_dict['passenger_link_flow'][mask_passenger]))
+            loss = np.linalg.norm(np.nan_to_num(x_e[mask_passenger] - one_data_dict['passenger_link_flow'][mask_passenger]))
             loss_dict['passenger_count_loss'] = loss
 
         # if self.config['use_bus_link_passenger_flow'] or self.config['compute_bus_link_passenger_flow_loss']:
@@ -2133,7 +2146,8 @@ class MMDODE:
         #     x_e = dta.get_link_bus_passenger_inflow(start_intervals, end_intervals).flatten(order='F')
         #     if self.config['bus_passenger_count_agg']:
         #         x_e = one_data_dict['bus_passenger_count_agg_L'].dot(x_e)
-        #     loss = self.config['link_bus_passenger_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e - one_data_dict['bus_link_passenger_flow']))
+        # #     loss = self.config['link_bus_passenger_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e - one_data_dict['bus_link_passenger_flow']))
+        #     loss = np.linalg.norm(np.nan_to_num(x_e - one_data_dict['bus_link_passenger_flow']))
         #     loss_dict['bus_passenger_count_loss'] = loss
 
         # if self.config['use_walking_link_passenger_flow'] or self.config['compute_walking_link_passenger_flow_loss']:
@@ -2141,7 +2155,8 @@ class MMDODE:
         #     x_e = dta.get_link_walking_passenger_inflow(start_intervals, end_intervals).flatten(order='F')
         #     if self.config['walking_passenger_count_agg']:
         #         x_e = one_data_dict['walking_passenger_count_agg_L'].dot(x_e)
-        #     loss = self.config['link_walking_passenger_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e - one_data_dict['walking_link_passenger_flow']))
+        # #     loss = self.config['link_walking_passenger_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e - one_data_dict['walking_link_passenger_flow']))
+        #     loss = np.linalg.norm(np.nan_to_num(x_e - one_data_dict['walking_link_passenger_flow']))
         #     loss_dict['walking_passenger_count_loss'] = loss
 
         # travel time loss
@@ -2160,8 +2175,8 @@ class MMDODE:
             x_tt_e[ind] = 0
             x_tt_o[ind] = 0
 
-            loss = self.config['link_car_tt_weight'] * np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_driving_link']] - x_tt_o[one_data_dict['mask_driving_link']]))
-            # loss = np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_driving_link']] - x_tt_o[one_data_dict['mask_driving_link']]))
+            # loss = self.config['link_car_tt_weight'] * np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_driving_link']] - x_tt_o[one_data_dict['mask_driving_link']]))
+            loss = np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_driving_link']] - x_tt_o[one_data_dict['mask_driving_link']]))
             loss_dict['car_tt_loss'] = loss
             
         if self.config['use_truck_link_tt'] or self.config['compute_truck_link_tt_loss']:
@@ -2178,8 +2193,8 @@ class MMDODE:
             x_tt_e[ind] = 0
             x_tt_o[ind] = 0
 
-            loss = self.config['link_truck_tt_weight'] * np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_driving_link']] - x_tt_o[one_data_dict['mask_driving_link']]))
-            # loss = np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_driving_link']] - x_tt_o[one_data_dict['mask_driving_link']]))
+            # loss = self.config['link_truck_tt_weight'] * np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_driving_link']] - x_tt_o[one_data_dict['mask_driving_link']]))
+            loss = np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_driving_link']] - x_tt_o[one_data_dict['mask_driving_link']]))
             loss_dict['truck_tt_loss'] = loss
 
         if self.config['use_bus_link_tt'] or self.config['compute_bus_link_tt_loss']:
@@ -2200,8 +2215,8 @@ class MMDODE:
             x_tt_e[ind] = 0
             x_tt_o[ind] = 0
 
-            loss = self.config['link_bus_tt_weight'] * np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_bus_link']] - x_tt_o[one_data_dict['mask_bus_link']]))
-            # loss = np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_bus_link']] - x_tt_o[one_data_dict['mask_bus_link']]))
+            # loss = self.config['link_bus_tt_weight'] * np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_bus_link']] - x_tt_o[one_data_dict['mask_bus_link']]))
+            loss = np.linalg.norm(np.nan_to_num(x_tt_e[one_data_dict['mask_bus_link']] - x_tt_o[one_data_dict['mask_bus_link']]))
             loss_dict['bus_tt_loss'] = loss
             
         if self.config['use_passenger_link_tt'] or self.config['compute_passenger_link_tt_loss']:
@@ -2238,8 +2253,8 @@ class MMDODE:
             else:
                 mask_passenger = one_data_dict['mask_bus_link']
 
-            loss = self.config['link_passenger_tt_weight'] * np.linalg.norm(np.nan_to_num(x_tt_e[mask_passenger] - x_tt_o[mask_passenger]))
-            # loss = np.linalg.norm(np.nan_to_num(x_tt_e[mask_passenger] - x_tt_o[mask_passenger]))
+            # loss = self.config['link_passenger_tt_weight'] * np.linalg.norm(np.nan_to_num(x_tt_e[mask_passenger] - x_tt_o[mask_passenger]))
+            loss = np.linalg.norm(np.nan_to_num(x_tt_e[mask_passenger] - x_tt_o[mask_passenger]))
             loss_dict['passenger_tt_loss'] = loss
 
         total_loss = 0.0
@@ -2472,7 +2487,8 @@ class MMDODE:
 
                 if save_folder is not None:
                     self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_path_flow'), 
-                                                     best_f_car_driving, best_f_truck_driving, best_f_passenger_bustransit, best_f_car_pnr, f_bus = None if fix_bus else best_f_bus)
+                                                     best_f_car_driving, best_f_truck_driving, best_f_passenger_bustransit, best_f_car_pnr, f_bus = None if fix_bus else best_f_bus,
+                                                     explicit_bus=0, historical_bus_waiting_time=0)
             
             # if 'passenger_count_loss' in loss_list[-1][-1]:
             #     pathflow_solver.scheduler.step(loss_list[-1][-1]['passenger_count_loss'])
@@ -2786,7 +2802,8 @@ class MMDODE:
 
                 if save_folder is not None:
                     self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_path_flow'), 
-                                                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus = None if fix_bus else f_bus)
+                                                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus = None if fix_bus else f_bus,
+                                                     explicit_bus=0, historical_bus_waiting_time=0)
             
             # if 'passenger_count_loss' in loss_list[-1][-1]:
             #     scheduler.step(loss_list[-1][-1]['passenger_count_loss'])
@@ -3016,7 +3033,8 @@ class MMDODE:
 
                 if save_folder is not None:
                     self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_path_flow'), 
-                                                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus=None if fix_bus else f_bus)
+                                                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus=None if fix_bus else f_bus,
+                                                     explicit_bus=0, historical_bus_waiting_time=0)
 
             if save_folder is not None:
                 pickle.dump([loss, loss_dict, loss_list, best_epoch,
@@ -3026,7 +3044,8 @@ class MMDODE:
 
                 # if column_generation[i]:
                 #     self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_path_flow'), 
-                #                                      f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus)
+                #                                      f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus,
+                #                                      explicit_bus=0, historical_bus_waiting_time=0)
 
             # if column_generation[i]:
             #     dta.build_link_cost_map()
@@ -3303,7 +3322,8 @@ class MMDODE:
 
                 if save_folder is not None:
                     self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_demand'), 
-                                                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus=None if fix_bus else f_bus)
+                                                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus=None if fix_bus else f_bus,
+                                                     explicit_bus=0, historical_bus_waiting_time=0)
 
             if save_folder is not None:
                 pickle.dump([loss, loss_dict, loss_list, best_epoch,
@@ -3315,7 +3335,8 @@ class MMDODE:
 
                 # if column_generation[i]:
                 #     self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_demand'), 
-                #                                      f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus)
+                #                                      f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus,
+                #                                      explicit_bus=0, historical_bus_waiting_time=0)
         
         print("Best loss at Epoch:", best_epoch, "Loss:", loss_list[best_epoch][0], self.print_separate_accuracy(loss_list[best_epoch][1]))
         return best_f_car_driving, best_f_truck_driving, best_f_passenger_bustransit, best_f_car_pnr, best_f_bus, best_q_e_passenger, best_q_e_truck, \
@@ -3564,7 +3585,8 @@ class MMDODE:
 
                 if save_folder is not None:
                     self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_demand'), 
-                                                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus=None if fix_bus else f_bus)
+                                                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus=None if fix_bus else f_bus,
+                                                     explicit_bus=0, historical_bus_waiting_time=0)
 
             if save_folder is not None:
                 pickle.dump([loss, loss_dict, loss_list, best_epoch,
@@ -3576,7 +3598,8 @@ class MMDODE:
 
                 # if column_generation[i]:
                 #     self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_demand'), 
-                #                                      f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus)
+                #                                      f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus,
+                #                                      explicit_bus=0, historical_bus_waiting_time=0)
         
         print("Best loss at Epoch:", best_epoch, "Loss:", loss_list[best_epoch][0], self.print_separate_accuracy(loss_list[best_epoch][1]))
         return best_f_car_driving, best_f_truck_driving, best_f_passenger_bustransit, best_f_car_pnr, best_f_bus, best_q_e_passenger, best_q_e_truck, \
@@ -3813,7 +3836,7 @@ class PostProcessing:
         # plt.ylim([0, 1])
         plt.xlim([1, len(loss_list)])
 
-        plt.savefig(os.path.join(self.result_folder, fig_name))
+        plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
         plt.show()
 
@@ -3871,7 +3894,7 @@ class PostProcessing:
             plt.ylim([0, 1.1])
             plt.xlim([1, len(loss_list)])
 
-            plt.savefig(os.path.join(self.result_folder, fig_name))
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
 
@@ -4115,7 +4138,7 @@ class PostProcessing:
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
 
-            plt.savefig(os.path.join(self.result_folder, fig_name))
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
 
@@ -4239,7 +4262,7 @@ class PostProcessing:
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
 
-            plt.savefig(os.path.join(self.result_folder, fig_name))
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
 
