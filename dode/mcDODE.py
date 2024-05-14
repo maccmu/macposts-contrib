@@ -163,16 +163,16 @@ class torch_pathflow_solver(nn.Module):
             self.log_f_truck = nn.Parameter(self.log_f_truck.reshape(-1))
 
     def generate_pathflow_tensor(self):
-        # exp
-        # f_car = torch.exp(self.log_f_car * self.car_scale)
-        # f_truck = torch.exp(self.log_f_truck * self.truck_scale)
+        # softplus
+        f_car = torch.nn.functional.softplus(self.log_f_car) * self.car_scale
+        f_truck = torch.nn.functional.softplus(self.log_f_truck) * self.truck_scale
 
         # f_car = torch.clamp(f_car, max=5e3)
         # f_truck = torch.clamp(f_truck, max=5e3)
 
         # relu
-        f_car = torch.clamp(self.log_f_car * self.car_scale, min=1e-6)
-        f_truck = torch.clamp(self.log_f_truck * self.truck_scale, min=1e-6)
+        # f_car = torch.clamp(self.log_f_car * self.car_scale, min=1e-6)
+        # f_truck = torch.clamp(self.log_f_truck * self.truck_scale, min=1e-6)
 
         return f_car, f_truck
 
@@ -1423,6 +1423,7 @@ class MCDODE():
                                     link_car_flow_weight=1, link_truck_flow_weight=1, 
                                     link_car_tt_weight=1, link_truck_tt_weight=1, origin_vehicle_registration_weight=1,
                                     max_epoch=10, algo='NAdam',
+                                    l2_coeff=1e-6,
                                     car_init_scale=10,
                                     truck_init_scale=1, 
                                     store_folder=None, 
@@ -1511,7 +1512,7 @@ class MCDODE():
                 
                 # grad of loss wrt log_f = grad of f wrt log_f (pytorch autograd) * grad of loss wrt f (manually)
                 pathflow_solver.compute_gradient(f_car, f_truck,
-                                                 f_car_grad=f_car_grad, f_truck_grad=f_truck_grad, l2_coeff=1e-6)
+                                                 f_car_grad=f_car_grad, f_truck_grad=f_truck_grad, l2_coeff=l2_coeff)
 
                 # update log_f
                 pathflow_solver.optimizer.step()
