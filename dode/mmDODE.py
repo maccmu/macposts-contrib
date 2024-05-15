@@ -325,7 +325,7 @@ class MMDODE:
         mat = coo_matrix((raw_record[:, 2], (bus_link_seq, bus_driving_link_seq)), shape=(len(self.observed_links_bus), len(self.observed_links_bus_driving)))
         mat = mat.tocsr()
 
-        self.bus_driving_link_relation = csr_matrix(scipy.sparse.block_diag((mat for _ in range(self.num_assign_interval))))
+        self.bus_driving_link_relation = csr_matrix(scipy.sparse.block_diag([mat for _ in range(self.num_assign_interval)]))
 
 
     def check_registered_links_covered_by_registered_paths(self, folder, add=False):
