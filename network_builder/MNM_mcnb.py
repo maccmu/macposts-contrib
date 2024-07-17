@@ -1149,3 +1149,68 @@ class MNM_network_builder():
             self.path_table.ID2path = new_ID2path
 
             print("update_path_table")
+
+def process_simulation_and_emission_txt(folder, save_dir=None):
+
+    f = open(os.path.join(folder, 'simulation.txt'), 'r')
+    logs = f.readlines()
+    f.close()
+
+    car_result = {
+        'Type': 'Car',
+        'Total vehicles': float(logs[1].strip().split(' ')[-1]),
+        'Total travel time (hour)' : float(logs[3].strip().split(' ')[-1]),
+        'Average travel time (minute)': float(logs[3].strip().split(' ')[-1]) / float(logs[1].strip().split(' ')[-1]) * 60., 
+        'Average delay (second)': float(logs[6].strip().split(' ')[-1]) * 60.,
+    }
+
+    truck_result = {
+        'Type': 'Truck',
+        'Total vehicles': float(logs[2].strip().split(' ')[-1]),
+        'Total travel time (hour)' : float(logs[4].strip().split(' ')[-1]),
+        'Average travel time (minute)': float(logs[4].strip().split(' ')[-1]) / float(logs[2].strip().split(' ')[-1]) * 60., 
+        'Average delay (second)': float(logs[7].strip().split(' ')[-1]) * 60.,
+    }
+
+    total_result = dict()
+    total_result['Type'] = 'Car + Truck'
+    total_result['Total vehicles'] = car_result['Total vehicles'] + truck_result['Total vehicles']
+    total_result['Total travel time (hour)'] = car_result['Total travel time (hour)'] + truck_result['Total travel time (hour)']
+    total_result['Average travel time (minute)'] = total_result['Total travel time (hour)'] / total_result['Total vehicles'] * 60.
+    total_result['Average delay (second)'] = float(logs[5].strip().split(' ')[-1]) * 60.
+
+    f = open(os.path.join(folder, 'emission.txt'), 'r')
+    logs = f.readlines()
+    f.close()
+
+    tmp = logs[1].strip().split(', ')
+    car_result.update({
+        'Fuel (gallon)': float(tmp[0].split(' ')[-2]),
+        'CO2 (kg)' : float(tmp[1].split(' ')[-2])/1e3,
+        'HC (kg)': float(tmp[2].split(' ')[-2])/1e3, 
+        'CO (kg)': float(tmp[3].split(' ')[-2])/1e3,
+        'NOX (kg)': float(tmp[4].split(' ')[-2])/1e3,
+        'Total VMT (mile)': float(tmp[5].split(' ')[-2]),
+        'EV VMT (mile)': float(tmp[6].split(' ')[-2]),
+        'VHT (hour)': float(tmp[7].split(' ')[-2]),
+    })
+    tmp = logs[3].strip().split(', ')
+    truck_result.update({
+        'Fuel (gallon)': float(tmp[0].split(' ')[-2]),
+        'CO2 (kg)' : float(tmp[1].split(' ')[-2])/1e3,
+        'HC (kg)': float(tmp[2].split(' ')[-2])/1e3, 
+        'CO (kg)': float(tmp[3].split(' ')[-2])/1e3,
+        'NOX (kg)': float(tmp[4].split(' ')[-2])/1e3,
+        'Total VMT (mile)': float(tmp[5].split(' ')[-2]),
+        'EV VMT (mile)': float(tmp[6].split(' ')[-2]),
+        'VHT (hour)': float(tmp[7].split(' ')[-2]),
+    })
+
+    for k in ['Fuel (gallon)', 'CO2 (kg)', 'HC (kg)', 'CO (kg)', 'NOX (kg)', 'Total VMT (mile)', 'EV VMT (mile)', 'VHT (hour)']:
+        total_result[k] = car_result[k] + truck_result[k]
+
+    df = pd.DataFrame([car_result, truck_result, total_result])
+    if save_dir is not None:
+        df.to_csv(save_dir, index=False)
+    return df
+    
