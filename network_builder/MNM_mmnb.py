@@ -1394,10 +1394,13 @@ class MNM_network_builder():
         self.route_choice_driving_flag = False
         self.route_choice_bustransit_flag = False
         self.route_choice_pnr_flag = False
+        self.driving_path_table_link_seq_flag = False
 
         self.emission_link_array = None
 
         self.link_toll_df = None
+        self.link_td_attribute_df = None
+        self.node_td_cost_df = None
 
     def set_network_driving_name(self, name):
         self.network_driving_name = name
@@ -1614,7 +1617,7 @@ class MNM_network_builder():
                         parking_lot_file_name = 'parking_lot', od_file_name = 'od',
                         driving_link_file_name = 'driving_link', driving_node_file_name = 'driving_node',
                         driving_graph_file_name = 'driving_graph', 
-                        driving_pathtable_file_name = 'driving_path_table', driving_path_p_file_name = 'driving_path_table_buffer',
+                        driving_pathtable_file_name = 'driving_path_table', driving_path_p_file_name = 'driving_path_table_buffer', driving_pathtable_link_seq_file_name = 'driving_path_table_link_seq',
                         driving_demand_file_name = 'driving_demand',
                         bus_pathtable_file_name = 'bus_path_table', bus_route_file_name = 'bus_route',
                         bus_demand_file_name = 'bus_demand',
@@ -1623,7 +1626,9 @@ class MNM_network_builder():
                         pnr_pathtable_file_name = 'pnr_path_table', pnr_path_p_file_name = 'pnr_path_table_buffer',
                         pnr_demand_file_name = 'pnr_demand',
                         total_passenger_demand_file_name = 'passenger_demand', emission_link_file_name='MNM_input_emission_linkID',
-                        link_toll_file_name='MNM_input_link_toll'):
+                        link_toll_file_name='MNM_input_link_toll',
+                        link_td_attribute_file_name='MNM_input_link_td_attribute',
+                        node_td_cost_file_name='MNM_input_node_td_cost'):
         
         self.folder_path = folder_path
 
@@ -1747,7 +1752,17 @@ class MNM_network_builder():
         # when this is a multiclass problem, this is equal to total number of car and truck columns
         # DIFFERENT FROM Wei's MULTICLASS
         if os.path.isfile(os.path.join(folder_path, driving_pathtable_file_name)):
-            self.path_table_driving.build_from_file(os.path.join(folder_path, driving_pathtable_file_name), starting_ID=path_count)
+            if os.path.isfile(os.path.join(folder_path, driving_pathtable_link_seq_file_name)):
+                self.path_table_driving.build_from_file(
+                    node_seq_file_name=os.path.join(folder_path, driving_pathtable_file_name), 
+                    starting_ID=path_count,
+                    link_seq_file_name=os.path.join(folder_path, driving_pathtable_link_seq_file_name))
+                self.driving_path_table_link_seq_flag = True
+            else:
+                self.path_table_driving.build_from_file(
+                    node_seq_file_name=os.path.join(folder_path, driving_pathtable_file_name), 
+                    starting_ID=path_count)
+
             if os.path.isfile(os.path.join(folder_path, driving_path_p_file_name)):
                 self.path_table_driving.load_route_choice_from_file(os.path.join(folder_path, driving_path_p_file_name), 
                                                                     buffer_length = self.config.config_dict['FIXED']['buffer_length']//2,
@@ -1881,6 +1896,16 @@ class MNM_network_builder():
         else:
             print("No link toll file")
 
+        if os.path.isfile(os.path.join(folder_path, link_td_attribute_file_name)):
+            self.link_td_attribute_df = pd.read_csv(os.path.join(folder_path, link_td_attribute_file_name), sep=" ")
+        else:
+            print("No time-dependent link attribute file")
+
+        if os.path.isfile(os.path.join(folder_path, node_td_cost_file_name)):
+            self.node_td_cost_df = pd.read_csv(os.path.join(folder_path, node_td_cost_file_name), sep=" ")
+        else:
+            print("No time-dependent node cost file")
+
     def generate_link_driving_text(self):
         tmp_str = '#ID Type LEN(mile) FFS_car(mile/h) Cap_car(v/hour) RHOJ_car(v/miles) Lane FFS_truck(mile/h) Cap_truck(v/hour) RHOJ_truck(v/miles) Convert_factor(1)\n'
         for link in self.link_driving_list:
@@ -1929,7 +1954,8 @@ class MNM_network_builder():
                         parking_lot_file_name = 'parking_lot', od_file_name = 'od',
                         driving_link_file_name = 'driving_link', driving_node_file_name = 'driving_node',
                         driving_graph_file_name = 'driving_graph', 
-                        driving_pathtable_file_name = 'driving_path_table', driving_path_p_file_name = 'driving_path_table_buffer',
+                        driving_pathtable_file_name = 'driving_path_table', driving_path_p_file_name = 'driving_path_table_buffer', 
+                        driving_pathtable_link_seq_file_name = 'driving_path_table_link_seq',
                         driving_demand_file_name = 'driving_demand',
                         bus_pathtable_file_name = 'bus_path_table', bus_route_file_name = 'bus_route',
                         bus_demand_file_name = 'bus_demand',
@@ -1938,7 +1964,9 @@ class MNM_network_builder():
                         pnr_pathtable_file_name = 'pnr_path_table', pnr_path_p_file_name = 'pnr_path_table_buffer',
                         pnr_demand_file_name = 'pnr_demand',
                         total_passenger_demand_file_name = 'passenger_demand', emission_link_file_name='MNM_input_emission_linkID',
-                        link_toll_file_name='MNM_input_link_toll'):
+                        link_toll_file_name='MNM_input_link_toll',
+                        link_td_attribute_file_name='MNM_input_link_td_attribute',
+                        node_td_cost_file_name='MNM_input_node_td_cost'):
         if not os.path.isdir(folder_path):
             os.makedirs(folder_path)
 
@@ -2055,6 +2083,11 @@ class MNM_network_builder():
             f = open(os.path.join(folder_path, driving_path_p_file_name), 'w')
             f.write(self.path_table_driving.generate_portion_text())
             f.close()
+        
+        if self.driving_path_table_link_seq_flag:
+            f = open(os.path.join(folder_path, driving_pathtable_link_seq_file_name), 'w')
+            f.write(self.path_table_driving.generate_table_text_link_seq())
+            f.close()
 
         # python 2
         # f = open(os.path.join(folder_path, driving_demand_file_name), 'wb')
@@ -2151,6 +2184,16 @@ class MNM_network_builder():
             self.link_toll_df.to_csv(os.path.join(folder_path, link_toll_file_name), sep=" ", index=False)
         else:
             print("No link toll file")
+
+        if self.link_td_attribute_df is not None:
+            self.link_td_attribute_df.to_csv(os.path.join(folder_path, link_td_attribute_file_name), sep=" ", index=False)
+        else:
+            print("No time-dependent link attribute file")
+
+        if self.node_td_cost_df is not None:
+            self.node_td_cost_df.to_csv(os.path.join(folder_path, node_td_cost_file_name), sep=" ", index=False)
+        else:
+            print("No time-dependent node cost file")
 
     def update_demand_path_driving(self, car_flow, truck_flow):
         # car_flow and truck_flow are 1D ndarrays recording the time-dependent flows with length of number of total paths x intervals

@@ -180,18 +180,18 @@ class MNM_od():
 
 class MNM_graph():
   def __init__(self):
-    self.G = nx.DiGraph()
+    self.G = nx.MultiDiGraph()
     self.edgeID_dict = OrderedDict()
 
   def add_edge(self, s, e, ID, create_node = False, overwriting = False):
-    if (not overwriting) and ((s,e) in self.G.edges()):
+    if (not overwriting) and self.G.has_edge(s, e, key=ID):
       raise("Error, exists edge in graph")
     elif (not create_node) and s in self.G.nodes():
       raise("Error, exists start node of edge in graph")
     elif (not create_node) and e in self.G.nodes():
       raise("Error, exists end node of edge in graph")
     else:
-      self.G.add_edge(s, e, ID = ID)
+      self.G.add_edge(s, e, key=ID, ID=ID)
       self.edgeID_dict[ID] = (s, e)
 
   def add_node(self, node, overwriting = True):
@@ -201,7 +201,7 @@ class MNM_graph():
       self.G.add_node(node)
 
   def build_from_file(self, file_name):
-    self.G = nx.DiGraph()
+    self.G = nx.MultiDiGraph()
     self.edgeID_dict = OrderedDict()
     # f = file(file_name)
     f = open(file_name, "r")
@@ -242,11 +242,12 @@ class MNM_path():
     self.node_list = list()
     self.route_portions = None
 
-  def __init__(self, node_list, path_ID):
+  def __init__(self, node_list, path_ID, link_list=None):
     self.path_ID = path_ID
     self.origin_node = node_list[0]
     self.destination_node = node_list[-1]
     self.node_list = node_list
+    self.link_list = link_list
     self.route_portions = None
 
   def __eq__(self, other):
@@ -262,6 +263,10 @@ class MNM_path():
     for i in range(len(self.node_list)):
       if self.node_list[i] != other.node_list[i]:
         return False
+    if (self.link_list is not None) and (other.link_list is not None):
+      for i in range(len(self.link_list)):
+        if self.link_list[i] != other.link_list[i]:
+          return False
     return True
 
   def create_route_choice_portions(self, num_intervals):
@@ -281,6 +286,10 @@ class MNM_path():
 
   def generate_node_list_text(self):
     return ' '.join([str(e) for e in self.node_list])
+  
+  def generate_link_list_text(self):
+    if self.link_list is not None:
+      return ' '.join([str(e) for e in self.link_list])
 
   def generate_portion_text(self):
     assert(self.route_portions is not None)
@@ -333,15 +342,23 @@ class MNM_pathtable():
     else:
       self.path_dict[pathset.origin_node][pathset.destination_node] = pathset
 
-  def build_from_file(self, file_name, w_ID = False):
+  def build_from_file(self, node_seq_file_name, w_ID = False, link_seq_file_name=None):
     if w_ID:
       raise ("Error, path table build_from_file no implemented")
     self.path_dict = dict()
     self.ID2path = OrderedDict()
     # f = file(file_name)
-    f = open(file_name, "r")
+    f = open(node_seq_file_name, "r")
     log = f.readlines()
     f.close()
+    
+    log2 = None
+    if link_seq_file_name is not None:
+      f = open(link_seq_file_name, "r")
+      log2 = f.readlines()
+      f.close()
+      assert(len(log)==len(log2))
+    
     for i in range(len(log)):
       tmp_str = log[i]
       if tmp_str == '':
@@ -357,7 +374,12 @@ class MNM_pathtable():
         tmp_path_set.destination_node = destination_node
         self.add_pathset(tmp_path_set)
       tmp_node_list = list(map(lambda x : int(x), words))
-      tmp_path = MNM_path(tmp_node_list, i)
+      tmp_link_list = None
+      if log2 is not None:
+        tmp_str2 = log2[i]
+        words2 = tmp_str2.split()
+        tmp_link_list = list(map(lambda x : int(x), words2))
+      tmp_path = MNM_path(tmp_node_list, i, tmp_link_list)
       self.path_dict[origin_node][destination_node].add_path(tmp_path)
       self.ID2path[i] = tmp_path
 
@@ -386,6 +408,15 @@ class MNM_pathtable():
     # python 3
     for path_ID, path in self.ID2path.items():
       tmp_str += path.generate_node_list_text() + '\n'
+    return tmp_str
+  
+  def generate_table_text_link_seq(self):
+    tmp_str = ""
+    # python 2
+    # for path_ID, path in self.ID2path.iteritems():
+    # python 3
+    for path_ID, path in self.ID2path.items():
+      tmp_str += path.generate_link_list_text() + '\n'
     return tmp_str
 
   def generate_portion_text(self):
@@ -542,6 +573,7 @@ class MNM_network_builder():
     self.demand = MNM_demand()
     self.path_table = MNM_pathtable()
     self.route_choice_flag = False
+    self.path_table_link_seq_flag = False
 
 
   def get_link(self, ID):
@@ -554,6 +586,7 @@ class MNM_network_builder():
                                     link_file_name = 'MNM_input_link', node_file_name = 'MNM_input_node',
                                     graph_file_name = 'Snap_graph', od_file_name = 'MNM_input_od',
                                     pathtable_file_name = 'path_table', path_p_file_name = 'path_table_buffer',
+                                    pathtable_link_seq_file_name = 'path_table_link_seq',
                                     demand_file_name = 'MNM_input_demand'):
     if os.path.isfile(os.path.join(path, config_file_name)):
       self.config.build_from_file(os.path.join(path, config_file_name))
@@ -583,7 +616,15 @@ class MNM_network_builder():
       print("No demand input")
 
     if os.path.isfile(os.path.join(path, pathtable_file_name)):
-      self.path_table.build_from_file(os.path.join(path, pathtable_file_name))
+      if os.path.isfile(os.path.join(path, pathtable_link_seq_file_name)):
+        self.path_table.build_from_file(
+          node_seq_file_name=os.path.join(path, pathtable_file_name), 
+          link_seq_file_name=os.path.join(path, pathtable_link_seq_file_name))
+        self.path_table_link_seq_flag = True
+      else:
+        self.path_table.build_from_file(
+          node_seq_file_name=os.path.join(path, pathtable_file_name))
+        
       if os.path.isfile(os.path.join(path, path_p_file_name)):
         self.path_table.load_route_choice_from_file(os.path.join(path, path_p_file_name))
         self.route_choice_flag = True
@@ -598,6 +639,7 @@ class MNM_network_builder():
                                     link_file_name = 'MNM_input_link', node_file_name = 'MNM_input_node',
                                     graph_file_name = 'Snap_graph', od_file_name = 'MNM_input_od',
                                     pathtable_file_name = 'path_table', path_p_file_name = 'path_table_buffer',
+                                    pathtable_link_seq_file_name = 'path_table_link_seq',
                                     demand_file_name = 'MNM_input_demand'):
     if not os.path.isdir(path):
       os.makedirs(path)
@@ -657,6 +699,11 @@ class MNM_network_builder():
       # python 3
       f = open(os.path.join(path, path_p_file_name), 'w')
       f.write(self.path_table.generate_portion_text())
+      f.close()
+
+    if self.path_table_link_seq_flag:
+      f = open(os.path.join(path, pathtable_link_seq_file_name), 'w')
+      f.write(self.path_table.generate_table_text_link_seq())
       f.close()
 
   def read_link_input(self, file_name):
