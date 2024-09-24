@@ -390,6 +390,8 @@ class MNM_path():
             if self.node_list[i] != other.node_list[i]:
                 return False
         if (self.link_list is not None) and (other.link_list is not None):
+            if (len(self.link_list) != len(other.link_list)):
+                return False
             for i in range(len(self.link_list)):
                 if self.link_list[i] != other.link_list[i]:
                     return False
