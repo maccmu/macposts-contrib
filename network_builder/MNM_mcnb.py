@@ -770,16 +770,25 @@ class MNM_network_builder():
                 return link
         return None
     
-    def get_link_coverage(self, link_list, path, graph_file_name='Snap_graph', pathtable_file_name='path_table'):
+    def get_link_coverage(self, link_list, path, graph_file_name='Snap_graph', pathtable_file_name='path_table', pathtable_link_seq_file_name='path_table_link_seq'):
         graph = pd.read_csv(os.path.join(path, graph_file_name), sep=' ', skiprows=1, header=None)
-        f = open(os.path.join(path, pathtable_file_name), 'r')
-        path_table = f.readlines()
-        f.close()
-        link_coverage = np.zeros((len(path_table), len(link_list)), dtype=int)
-        for i, path in enumerate(path_table):
-            path_nodes = [int(x) for x in path.strip().split(' ')]
-            path_links = [graph.loc[(graph.loc[:, 1] == path_nodes[j]) & (graph.loc[:, 2] == path_nodes[j+1]), 0].values[0] for j in range(len(path_nodes)-1)]
-            link_coverage[i, :] = np.array([int(observed_link in path_links) for observed_link in link_list])
+        if os.path.isfile(path, pathtable_link_seq_file_name):
+            f = open(os.path.join(path, pathtable_link_seq_file_name), 'r')
+            path_table = f.readlines()
+            f.close()
+            link_coverage = np.zeros((len(path_table), len(link_list)), dtype=int)
+            for i, path in enumerate(path_table):
+                path_links = [int(x) for x in path.strip().split(' ')]
+                link_coverage[i, :] = np.array([int(observed_link in path_links) for observed_link in link_list])
+        else:
+            f = open(os.path.join(path, pathtable_file_name), 'r')
+            path_table = f.readlines()
+            f.close()
+            link_coverage = np.zeros((len(path_table), len(link_list)), dtype=int)
+            for i, path in enumerate(path_table):
+                path_nodes = [int(x) for x in path.strip().split(' ')]
+                path_links = [graph.loc[(graph.loc[:, 1] == path_nodes[j]) & (graph.loc[:, 2] == path_nodes[j+1]), 0].values[0] for j in range(len(path_nodes)-1)]
+                link_coverage[i, :] = np.array([int(observed_link in path_links) for observed_link in link_list])
         return link_coverage
 
     def load_from_folder(self, path, config_file_name='config.conf',
