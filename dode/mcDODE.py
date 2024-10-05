@@ -2511,12 +2511,14 @@ class PostProcessing:
             
             self.estimated_car_cost = np.maximum(self.estimated_car_cost, tt_free)
 
-            self.estimated_car_speed = self.link_length[np.newaxis, :] / self.estimated_car_cost.reshape(len(start_intervals), -1) * 3600  # mph
-            self.estimated_car_speed = self.estimated_car_speed.flatten(order='C')
+            if self.link_length is not None:
+                self.estimated_car_speed = self.link_length[np.newaxis, :] / self.estimated_car_cost.reshape(len(start_intervals), -1) * 3600  # mph
+                self.estimated_car_speed = self.estimated_car_speed.flatten(order='C')
 
             self.true_car_cost, self.estimated_car_cost = self.true_car_cost[self.one_data_dict['mask_driving_link']], self.estimated_car_cost[self.one_data_dict['mask_driving_link']]
 
-            self.true_car_speed, self.estimated_car_speed = self.true_car_speed[self.one_data_dict['mask_driving_link']], self.estimated_car_speed[self.one_data_dict['mask_driving_link']]
+            if self.link_length is not None:
+                self.true_car_speed, self.estimated_car_speed = self.true_car_speed[self.one_data_dict['mask_driving_link']], self.estimated_car_speed[self.one_data_dict['mask_driving_link']]
 
 
         if self.dode.config['use_truck_link_tt']:
@@ -2533,12 +2535,14 @@ class PostProcessing:
             
             self.estimated_truck_cost = np.maximum(self.estimated_truck_cost, tt_free)
 
-            self.estimated_truck_speed = self.link_length[np.newaxis, :] / self.estimated_truck_cost.reshape(len(start_intervals), -1) * 3600 
-            self.estimated_truck_speed = self.estimated_truck_speed.flatten(order='C')
+            if self.link_length is not None:
+                self.estimated_truck_speed = self.link_length[np.newaxis, :] / self.estimated_truck_cost.reshape(len(start_intervals), -1) * 3600 
+                self.estimated_truck_speed = self.estimated_truck_speed.flatten(order='C')
             
             self.true_truck_cost, self.estimated_truck_cost = self.true_truck_cost[self.one_data_dict['mask_driving_link']], self.estimated_truck_cost[self.one_data_dict['mask_driving_link']]
 
-            self.true_truck_speed, self.estimated_truck_speed = self.true_truck_speed[self.one_data_dict['mask_driving_link']], self.estimated_truck_speed[self.one_data_dict['mask_driving_link']]
+            if self.link_length is not None:
+                self.true_truck_speed, self.estimated_truck_speed = self.true_truck_speed[self.one_data_dict['mask_driving_link']], self.estimated_truck_speed[self.one_data_dict['mask_driving_link']]
 
         # origin vehicle registration data
         if self.dode.config['use_origin_vehicle_registration_data']:
@@ -2749,24 +2753,30 @@ class PostProcessing:
 
     def cal_r2_speed(self):
         if self.dode.config['use_car_link_tt']:
-            print('----- car speed -----')
-            print(self.true_car_speed)
-            print(self.estimated_car_speed)
-            print('----- car speed -----')
-            # ind = ~((self.true_car_speed > 90) + (self.estimated_car_speed > 90) + (self.true_car_speed < 10) + (self.estimated_car_speed < 10) + np.isnan(self.true_car_speed) + np.isnan(self.estimated_car_speed) + (self.estimated_car_speed > 3 * self.true_car_speed)
-            #         + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost) + (self.estimated_car_cost > 3 * self.true_car_cost))
-            ind = ~(np.isnan(self.true_car_speed) + np.isnan(self.estimated_car_speed) + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost))
-            self.r2_car_speed = r2_score(self.true_car_speed[ind], self.estimated_car_speed[ind])
+            if self.true_car_speed is not None and self.estimated_car_speed is not None:
+                print('----- car speed -----')
+                print(self.true_car_speed)
+                print(self.estimated_car_speed)
+                print('----- car speed -----')
+                # ind = ~((self.true_car_speed > 90) + (self.estimated_car_speed > 90) + (self.true_car_speed < 10) + (self.estimated_car_speed < 10) + np.isnan(self.true_car_speed) + np.isnan(self.estimated_car_speed) + (self.estimated_car_speed > 3 * self.true_car_speed)
+                #         + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost) + (self.estimated_car_cost > 3 * self.true_car_cost))
+                ind = ~(np.isnan(self.true_car_speed) + np.isnan(self.estimated_car_speed) + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost))
+                self.r2_car_speed = r2_score(self.true_car_speed[ind], self.estimated_car_speed[ind])
+            else:
+                print("Car speed not calculated.")
 
         if self.dode.config['use_truck_link_tt']:
-            print('----- truck speed -----')
-            print(self.true_truck_speed)
-            print(self.estimated_truck_speed)
-            print('----- truck speed -----')
-            # ind = ~((self.true_truck_speed > 90) + (self.estimated_truck_speed > 90) + (self.true_truck_speed < 10) + (self.estimated_truck_speed < 10) + np.isnan(self.true_truck_speed) + np.isnan(self.estimated_truck_speed) + (self.estimated_truck_speed > 3 * self.true_truck_speed)
-            #         + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost) + (self.estimated_truck_cost > 3 * self.true_truck_cost))
-            ind = ~(np.isnan(self.true_truck_speed) + np.isnan(self.estimated_truck_speed) + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost))
-            self.r2_truck_speed = r2_score(self.true_truck_speed[ind], self.estimated_truck_speed[ind])
+            if self.true_truck_speed is not None and self.estimated_truck_speed is not None:
+                print('----- truck speed -----')
+                print(self.true_truck_speed)
+                print(self.estimated_truck_speed)
+                print('----- truck speed -----')
+                # ind = ~((self.true_truck_speed > 90) + (self.estimated_truck_speed > 90) + (self.true_truck_speed < 10) + (self.estimated_truck_speed < 10) + np.isnan(self.true_truck_speed) + np.isnan(self.estimated_truck_speed) + (self.estimated_truck_speed > 3 * self.true_truck_speed)
+                #         + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost) + (self.estimated_truck_cost > 3 * self.true_truck_cost))
+                ind = ~(np.isnan(self.true_truck_speed) + np.isnan(self.estimated_truck_speed) + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost))
+                self.r2_truck_speed = r2_score(self.true_truck_speed[ind], self.estimated_truck_speed[ind])
+            else:
+                print("Truck speed not calculated.")
 
         print("r2 speed --- r2_car_speed: {}, r2_truck_speed: {}"
             .format(
@@ -2890,7 +2900,7 @@ class PostProcessing:
             
             i = 0
 
-            if self.dode.config['use_car_link_tt']:
+            if self.dode.config['use_car_link_tt'] and (self.true_car_speed is not None and self.estimated_car_speed is not None):
                 # ind = ~((self.true_car_speed > 90) + (self.estimated_car_speed > 90) + (self.true_car_speed < 10) + (self.estimated_car_speed < 10) + np.isnan(self.true_car_speed) + np.isnan(self.estimated_car_speed) + (self.estimated_car_speed > 3 * self.true_car_speed)
                 #          + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost) + (self.estimated_car_cost > 3 * self.true_car_cost))
                 ind = ~(np.isnan(self.true_car_speed) + np.isnan(self.estimated_car_speed) + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost))
@@ -2911,7 +2921,7 @@ class PostProcessing:
 
             i += self.dode.config['use_car_link_tt']
 
-            if self.dode.config['use_truck_link_tt']:
+            if self.dode.config['use_truck_link_tt'] and (self.true_truck_speed is not None and self.estimated_truck_speed is not None):
                 # ind = ~((self.true_truck_speed > 90) + (self.estimated_truck_speed > 90) + (self.true_truck_speed < 10) + (self.estimated_truck_speed < 10) + np.isnan(self.true_truck_speed) + np.isnan(self.estimated_truck_speed) + (self.estimated_truck_speed > 3 * self.true_truck_speed)
                 #         + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost) + (self.estimated_truck_cost > 3 * self.true_truck_cost))
                 ind = ~(np.isnan(self.true_truck_speed) + np.isnan(self.estimated_truck_speed) + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost))
@@ -2930,6 +2940,7 @@ class PostProcessing:
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
 
-            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
+            if not axes.flat:
+                plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
-            plt.show()
+                plt.show()
