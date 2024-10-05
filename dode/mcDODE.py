@@ -311,7 +311,7 @@ class MCDODE():
             self._add_truck_link_flow_data(data_dict['truck_link_flow'])
         if self.config['use_car_link_tt'] or self.config['compute_car_link_tt_loss']:
             self._add_car_link_tt_data(data_dict['car_link_tt'])
-        if self.config['use_truck_link_tt']or self.config['compute_car_link_tt_loss']:
+        if self.config['use_truck_link_tt'] or self.config['compute_car_link_tt_loss']:
             self._add_truck_link_tt_data(data_dict['truck_link_tt'])
         if self.config['use_origin_vehicle_registration_data'] or self.config['compute_origin_vehicle_registration_loss']:
             self._add_origin_vehicle_registration_data(data_dict['origin_vehicle_registration_data'])
