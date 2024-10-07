@@ -2370,6 +2370,8 @@ class PostProcessing:
         self.result_folder = result_folder
         self.one_data_dict = None
 
+        self.observed_link_list = None
+
         self.f_car = f_car
         self.f_truck = f_truck
 
@@ -2573,6 +2575,7 @@ class PostProcessing:
             self.estimated_origin_vehicle_registration['truck'] = self.estimated_origin_vehicle_registration['truck'] * self.dode.config['origin_registration_data_truck_weight']
             self.estimated_origin_vehicle_registration = self.estimated_origin_vehicle_registration.loc[:, ['car', 'truck']].sum(axis=1)
             
+        self.observed_link_list = self.dode.observed_links[self.one_data_dict['mask_driving_link'][:len(self.dode.observed_links)]]
 
     def cal_r2_count(self):
 
@@ -2670,7 +2673,7 @@ class PostProcessing:
     def scatter_plot_count_by_link(self, link_list=None, fig_name =  'link_flow_scatterplot_pathflow_by_link'):
         if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow']:
             if link_list is None:
-                link_list = self.dode.observed_links
+                link_list = self.observed_link_list
             if self.dode.config['use_car_link_flow']:
                 true_car_count = self.true_car_count.reshape(self.dode.num_assign_interval, -1) 
                 estimated_car_count = self.estimated_car_count.reshape(self.dode.num_assign_interval, -1) 
@@ -2685,8 +2688,8 @@ class PostProcessing:
                 i = 0
                 
                 if self.dode.config['use_car_link_flow']:
-                    link_true_car_count = true_car_count[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
-                    link_estimated_car_count = estimated_car_count[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
+                    link_true_car_count = true_car_count[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_car_count = estimated_car_count[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
                     ind = ~(np.isinf(link_true_car_count) + np.isinf(link_estimated_car_count) + np.isnan(link_true_car_count) + np.isnan(link_estimated_car_count))
                     m_car_max = int(np.max((np.max(link_true_car_count[ind]), np.max(link_estimated_car_count[ind]))) + 1) if any(ind) else 20
                     axes[0, i].scatter(link_true_car_count[ind], link_estimated_car_count[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
@@ -2704,8 +2707,8 @@ class PostProcessing:
                 i += self.dode.config['use_car_link_flow']
 
                 if self.dode.config['use_truck_link_flow']:
-                    link_true_truck_count = true_truck_count[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
-                    link_estimated_truck_count = estimated_truck_count[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
+                    link_true_truck_count = true_truck_count[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_truck_count = estimated_truck_count[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
                     ind = ~(np.isinf(link_true_truck_count) + np.isinf(link_estimated_truck_count) + np.isnan(link_true_truck_count) + np.isnan(link_estimated_truck_count))
                     m_truck_max = int(np.max((np.max(link_true_truck_count[ind]), np.max(link_estimated_truck_count[ind]))) + 1) if any(ind) else 20
                     axes[0, i].scatter(link_true_truck_count[ind], link_estimated_truck_count[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
