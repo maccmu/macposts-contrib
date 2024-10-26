@@ -213,6 +213,10 @@ class MCDODE():
             self.config['origin_registration_data_car_weight'] = 1
         if 'origin_registration_data_truck_weight' not in self.config:
             self.config['origin_registration_data_truck_weight'] = 1
+        if 'od_demand_data_car_weight' not in self.config:
+            self.config['od_demand_data_car_weight'] = 1
+        if 'od_demand_data_truck_weight' not in self.config:
+            self.config['od_demand_data_truck_weight'] = 1
 
         self.nb = nb
         self.num_assign_interval = nb.config.config_dict['DTA']['max_interval']
@@ -299,6 +303,10 @@ class MCDODE():
         # assert (self.config['use_truck_link_tt'])
         assert (self.num_data == len(origin_vehicle_registration_data_list))
         self.data_dict['origin_vehicle_registration_data'] = origin_vehicle_registration_data_list
+    
+    def _add_od_demand_data(self, od_demand_data_list):
+        assert (self.num_data == len(od_demand_data_list))
+        self.data_dict['od_demand_data'] = od_demand_data_list
 
     def add_data(self, data_dict):
         if self.config['car_count_agg']:
@@ -315,11 +323,18 @@ class MCDODE():
             self._add_truck_link_tt_data(data_dict['truck_link_tt'])
         if self.config['use_origin_vehicle_registration_data'] or self.config['compute_origin_vehicle_registration_loss']:
             self._add_origin_vehicle_registration_data(data_dict['origin_vehicle_registration_data'])
+        if self.config['use_od_demand_data'] or self.config['compute_od_demand_loss']:
+            self._add_od_demand_data(data_dict['od_demand_data'])
 
         if 'mask_driving_link' in data_dict:
             self.data_dict['mask_driving_link'] = np.tile(data_dict['mask_driving_link'], self.num_assign_interval)
         else:
             self.data_dict['mask_driving_link'] = np.ones(len(self.observed_links) * self.num_assign_interval, dtype=bool)
+
+        if 'link_loss_weight_count_car' in data_dict:
+            self.data_dict['link_loss_weight_count_car'] = np.tile(data_dict['link_loss_weight_count_car'], self.num_assign_interval)
+        if 'link_loss_weight_count_truck' in data_dict:
+            self.data_dict['link_loss_weight_count_truck'] = np.tile(data_dict['link_loss_weight_count_truck'], self.num_assign_interval)
 
     def save_simulation_input_files(self, folder_path, f_car=None, f_truck=None):
 
@@ -807,6 +822,11 @@ class MCDODE():
             f_car_grad += self.config['origin_vehicle_registration_weight'] * f_car_grad_add
             f_truck_grad += self.config['origin_vehicle_registration_weight'] * f_truck_grad_add
 
+        if self.config['use_od_demand_data']:
+            f_car_grad_add, f_truck_grad_add, _ = self._compute_grad_on_od_demand_data(one_data_dict, f_car, f_truck, od_demand_factor=1.0)
+            f_car_grad += self.config['od_demand_weight'] * f_car_grad_add
+            f_truck_grad += self.config['od_demand_weight'] * f_truck_grad_add
+
         if 'regularization_weight' in self.config:
             f_car_grad += self.config['regularization_weight'] * f_car
             f_truck_grad += self.config['regularization_weight'] * f_truck
@@ -823,6 +843,8 @@ class MCDODE():
         if self.config['car_count_agg']:
             x_e = one_data_dict['car_count_agg_L'].dot(x_e)
         discrepancy = np.nan_to_num(link_flow_array - x_e)
+        if 'link_loss_weight_count_car' in one_data_dict:
+            discrepancy = discrepancy * one_data_dict['link_loss_weight_count_car']
         grad = - discrepancy
         if self.config['car_count_agg']:
             grad = one_data_dict['car_count_agg_L'].T.dot(grad)
@@ -837,6 +859,8 @@ class MCDODE():
         if self.config['truck_count_agg']:
             x_e = one_data_dict['truck_count_agg_L'].dot(x_e)
         discrepancy = np.nan_to_num(link_flow_array - x_e)
+        if 'link_loss_weight_count_truck' in one_data_dict:
+            discrepancy = discrepancy * one_data_dict['link_loss_weight_count_truck']
         grad = - discrepancy
         if self.config['truck_count_agg']:
             grad = one_data_dict['truck_count_agg_L'].T.dot(grad)
@@ -1328,12 +1352,45 @@ class MCDODE():
         O_demand_est = {O: (O_demand_est[O][0].item(), O_demand_est[O][1].item()) for O in O_demand_est}
         return f_car.grad.data.cpu().numpy(), f_truck.grad.data.cpu().numpy(), O_demand_est
 
+    def _compute_grad_on_od_demand_data(self, one_data_dict, f_car, f_truck, od_demand_factor=1.0):
+        # reshape car_flow and truck_flow into ndarrays with dimensions of intervals x number of total paths
+        f_car = torch.from_numpy(f_car)
+        f_truck = torch.from_numpy(f_truck)
+        f_car.requires_grad = True
+        f_truck.requires_grad = True
+
+        f_car_reshaped = f_car.reshape(self.num_assign_interval, -1)
+        f_truck_reshaped = f_truck.reshape(self.num_assign_interval, -1)
+
+        OD_demand_est = dict()
+        for i, path_ID in enumerate(self.nb.path_table.ID2path.keys()):
+            path = self.nb.path_table.ID2path[path_ID]
+            O_node = path.origin_node
+            D_node = path.destination_node
+            O = self.nb.od.O_dict.inv[O_node]
+            D = self.nb.od.D_dict.inv[D_node]
+            if (O, D) not in OD_demand_est:
+                OD_demand_est[(O, D)] = [torch.zeros(self.num_assign_interval), torch.zeros(self.num_assign_interval)]
+            OD_demand_est[(O, D)][0] = OD_demand_est[(O, D)][0] + f_car_reshaped[:, i]
+            OD_demand_est[(O, D)][1] = OD_demand_est[(O, D)][1] + f_truck_reshaped[:, i]
+
+                # pandas DataFrame
+        def process_one_row(row):
+
+            loss = self.config['od_demand_data_car_weight'] * sum((OD_demand_est[(row['origin_ID'], row['destination_ID'])][0] - od_demand_factor * row['car'])**2) + \
+                   self.config['od_demand_data_truck_weight'] * sum((OD_demand_est[(row['origin_ID'], row['destination_ID'])][1] - od_demand_factor * row['truck'])**2) 
+
+            loss.backward()
+
+        one_data_dict['od_demand_data'].apply(lambda row: process_one_row(row), axis=1)
+        return f_car.grad.data.cpu().numpy(), f_truck.grad.data.cpu().numpy(), OD_demand_est
+
     def _get_one_data(self, j):
         assert (self.num_data > j)
         one_data_dict = dict()
         if self.config['use_car_link_flow'] or self.config['compute_car_link_flow_loss']:
             one_data_dict['car_link_flow'] = self.data_dict['car_link_flow'][j]
-        if self.config['use_truck_link_flow']or self.config['compute_truck_link_flow_loss']:
+        if self.config['use_truck_link_flow'] or self.config['compute_truck_link_flow_loss']:
             one_data_dict['truck_link_flow'] = self.data_dict['truck_link_flow'][j]
         if self.config['use_car_link_tt'] or self.config['compute_car_link_tt_loss']:
             one_data_dict['car_link_tt'] = self.data_dict['car_link_tt'][j]
@@ -1346,14 +1403,22 @@ class MCDODE():
         if self.config['use_origin_vehicle_registration_data'] or self.config['compute_origin_vehicle_registration_loss']:
             # pandas DataFrame
             one_data_dict['origin_vehicle_registration_data'] = self.data_dict['origin_vehicle_registration_data'][j]
+        if self.config['use_od_demand_data'] or self.config['compute_od_demand_loss']:
+            # pandas DataFrame
+            one_data_dict['od_demand_data'] = self.data_dict['od_demand_data'][j]
 
         if 'mask_driving_link' in self.data_dict:
             one_data_dict['mask_driving_link'] = self.data_dict['mask_driving_link']
         else:
             one_data_dict['mask_driving_link'] = np.ones(len(self.observed_links) * self.num_assign_interval, dtype=bool)
+
+        if 'link_loss_weight_count_car' in self.data_dict and self.config['compute_car_link_flow_loss']:
+            one_data_dict['link_loss_weight_count_car'] = self.data_dict['link_loss_weight_count_car']
+        if 'link_loss_weight_count_truck' in self.data_dict and self.config['compute_truck_link_flow_loss']:
+            one_data_dict['link_loss_weight_count_truck'] = self.data_dict['link_loss_weight_count_truck']
         return one_data_dict
 
-    def aggregate_f(self, f_car, f_truck):
+    def aggregate_f_to_O_demand(self, f_car, f_truck):
         # reshape car_flow and truck_flow into ndarrays with dimensions of intervals x number of total paths
         f_car = f_car.reshape(self.num_assign_interval, -1)
         f_truck = f_truck.reshape(self.num_assign_interval, -1)
@@ -1370,6 +1435,26 @@ class MCDODE():
         f_car = f_car.flatten()
         f_truck = f_truck.flatten()
         return O_demand_est
+    
+    def aggregate_f_to_OD_demand(self, f_car, f_truck):
+        # reshape car_flow and truck_flow into ndarrays with dimensions of intervals x number of total paths
+        f_car = f_car.reshape(self.num_assign_interval, -1)
+        f_truck = f_truck.reshape(self.num_assign_interval, -1)
+
+        OD_demand_est = dict()
+        for i, path_ID in enumerate(self.nb.path_table.ID2path.keys()):
+            path = self.nb.path_table.ID2path[path_ID]
+            O_node = path.origin_node
+            D_node = path.destination_node
+            O = self.nb.od.O_dict.inv[O_node]
+            D = self.nb.od.D_dict.inv[D_node]
+            if (O, D) not in OD_demand_est:
+                OD_demand_est[(O,D)] = [np.zeros(self.num_assign_interval), np.zeros(self.num_assign_interval)]
+            OD_demand_est[(O, D)][0] = OD_demand_est[(O, D)][0] + f_car[:, i]
+            OD_demand_est[(O, D)][1] = OD_demand_est[(O, D)][1] + f_truck[:, i]
+        f_car = f_car.flatten()
+        f_truck = f_truck.flatten()
+        return OD_demand_est
 
     def _get_loss(self, one_data_dict, dta, f_car, f_truck):
         loss_dict = dict()
@@ -1406,13 +1491,21 @@ class MCDODE():
             loss_dict['truck_tt_loss'] = loss
 
         if self.config['use_origin_vehicle_registration_data'] or self.config['compute_origin_vehicle_registration_loss']:
-            O_demand_est = self.aggregate_f(f_car, f_truck)
+            O_demand_est = self.aggregate_f_to_O_demand(f_car, f_truck)
             def process_one_row(row):
-                return self.config['origin_registration_data_car_weight'] * (sum(O_demand_est[Origin_ID][0] for Origin_ID in row['origin_ID']) - row['car'])**2 + \
-                       self.config['origin_registration_data_truck_weight'] * (sum(O_demand_est[Origin_ID][1] for Origin_ID in row['origin_ID']) - row['truck'])**2
+                return (sum(O_demand_est[Origin_ID][0] for Origin_ID in row['origin_ID']) - row['car'])**2 + \
+                       (sum(O_demand_est[Origin_ID][1] for Origin_ID in row['origin_ID']) - row['truck'])**2
             loss = np.sqrt(np.nansum(one_data_dict['origin_vehicle_registration_data'].apply(lambda row: process_one_row(row), axis=1)))
             # loss_dict['origin_vehicle_registration_loss'] = self.config['origin_vehicle_registration_weight'] * loss
             loss_dict['origin_vehicle_registration_loss'] = loss
+
+        if self.config['use_od_demand_data'] or self.config['compute_od_demand_loss']:
+            OD_demand_est = self.aggregate_f_to_OD_demand(f_car, f_truck)
+            def process_one_row(row):
+                return np.linalg.norm(OD_demand_est[(row['origin_ID'], row['destination_ID'])][0] - row['car'])**2 + \
+                       np.linalg.norm(OD_demand_est[(row['origin_ID'], row['destination_ID'])][1] - row['truck'])**2
+            loss = np.sqrt(np.nansum(one_data_dict['od_demand_data'].apply(lambda row: process_one_row(row), axis=1)))
+            loss_dict['od_demand_loss'] = loss
 
         total_loss = 0.0
         for loss_type, loss_value in loss_dict.items():
@@ -1421,7 +1514,7 @@ class MCDODE():
 
     def estimate_path_flow_pytorch(self, car_step_size=0.1, truck_step_size=0.1, 
                                     link_car_flow_weight=1, link_truck_flow_weight=1, 
-                                    link_car_tt_weight=1, link_truck_tt_weight=1, origin_vehicle_registration_weight=1,
+                                    link_car_tt_weight=1, link_truck_tt_weight=1, origin_vehicle_registration_weight=1, od_demand_weight=1,
                                     max_epoch=10, algo='NAdam',
                                     l2_coeff=1e-6,
                                     car_init_scale=10,
@@ -1454,6 +1547,10 @@ class MCDODE():
         if np.isscalar(origin_vehicle_registration_weight):
             origin_vehicle_registration_weight = np.ones(max_epoch, dtype=bool) * origin_vehicle_registration_weight
         assert(len(origin_vehicle_registration_weight) == max_epoch)
+
+        if np.isscalar(od_demand_weight):
+            od_demand_weight = np.ones(max_epoch, dtype=bool) * od_demand_weight
+        assert(len(od_demand_weight) == max_epoch)
 
         loss_list = list()
         best_epoch = starting_epoch
@@ -1495,7 +1592,7 @@ class MCDODE():
             self.config['link_truck_tt_weight'] = link_truck_tt_weight[i] * (self.config['use_truck_link_tt'] or self.config['compute_truck_link_tt_loss'])
 
             self.config['origin_vehicle_registration_weight'] = origin_vehicle_registration_weight[i] * (self.config['use_origin_vehicle_registration_data'] or self.config['compute_origin_vehicle_registration_loss'])
-
+            self.config['od_demand_weight'] = od_demand_weight[i] * (self.config['use_od_demand_data'] or self.config['compute_od_demand_loss'])
             for j in seq:
                 one_data_dict = self._get_one_data(j)
 
@@ -1585,7 +1682,7 @@ class MCDODE():
 
     def estimate_path_flow_pytorch2(self, car_step_size=0.1, truck_step_size=0.1, 
                                     link_car_flow_weight=1, link_truck_flow_weight=1, 
-                                    link_car_tt_weight=1, link_truck_tt_weight=1, origin_vehicle_registration_weight=1,
+                                    link_car_tt_weight=1, link_truck_tt_weight=1, origin_vehicle_registration_weight=1, od_demand_weight=1,
                                     max_epoch=10, algo='NAdam', normalized_by_scale = True,
                                     car_init_scale=10,
                                     truck_init_scale=1, 
@@ -1617,6 +1714,10 @@ class MCDODE():
         if np.isscalar(origin_vehicle_registration_weight):
             origin_vehicle_registration_weight = np.ones(max_epoch, dtype=bool) * origin_vehicle_registration_weight
         assert(len(origin_vehicle_registration_weight) == max_epoch)
+
+        if np.isscalar(od_demand_weight):
+            od_demand_weight = np.ones(max_epoch, dtype=bool) * od_demand_weight
+        assert(len(od_demand_weight) == max_epoch)
 
         loss_list = list()
         best_epoch = starting_epoch
@@ -1679,7 +1780,7 @@ class MCDODE():
             self.config['link_truck_tt_weight'] = link_truck_tt_weight[i] * (self.config['use_truck_link_tt'] or self.config['compute_truck_link_tt_loss'])
 
             self.config['origin_vehicle_registration_weight'] = origin_vehicle_registration_weight[i] * (self.config['use_origin_vehicle_registration_data'] or self.config['compute_origin_vehicle_registration_loss'])
-
+            self.config['od_demand_weight'] = od_demand_weight[i] * (self.config['use_od_demand_data'] or self.config['compute_od_demand_loss'])
             for j in seq:
                 one_data_dict = self._get_one_data(j)
                 car_grad, truck_grad, tmp_loss, tmp_loss_dict, dta, x_e_car, x_e_truck, tt_e_car, tt_e_truck, O_demand = self.compute_path_flow_grad_and_loss(one_data_dict, f_car, f_truck)
@@ -1768,7 +1869,7 @@ class MCDODE():
 
     def estimate_path_flow(self, car_step_size=0.1, truck_step_size=0.1, 
                             link_car_flow_weight=1, link_truck_flow_weight=1, 
-                            link_car_tt_weight=1, link_truck_tt_weight=1, origin_vehicle_registration_weight=1e-6,
+                            link_car_tt_weight=1, link_truck_tt_weight=1, origin_vehicle_registration_weight=1e-6, od_demand_weight=1.0,
                             max_epoch=10, car_init_scale=10, truck_init_scale=1, store_folder=None, use_file_as_init=None, 
                             adagrad=False, starting_epoch=0):
 
@@ -1791,6 +1892,10 @@ class MCDODE():
         if np.isscalar(origin_vehicle_registration_weight):
             origin_vehicle_registration_weight = np.ones(max_epoch, dtype=bool) * origin_vehicle_registration_weight
         assert(len(origin_vehicle_registration_weight) == max_epoch)
+
+        if np.isscalar(od_demand_weight):
+            od_demand_weight = np.ones(max_epoch, dtype=bool) * od_demand_weight
+        assert(len(od_demand_weight) == max_epoch)
     
         # here the basic variables to be estimated are path flows, not OD demand, so no route choice model, unlike in sDODE.py
         loss_list = list()
@@ -1829,7 +1934,7 @@ class MCDODE():
             self.config['link_truck_tt_weight'] = link_truck_tt_weight[i] * (self.config['use_truck_link_tt'] or self.config['compute_truck_link_tt_loss'])
 
             self.config['origin_vehicle_registration_weight'] = origin_vehicle_registration_weight[i] * (self.config['use_origin_vehicle_registration_data'] or self.config['compute_origin_vehicle_registration_loss'])
-
+            self.config['od_demand_weight'] = od_demand_weight[i] * (self.config['use_od_demand_data'] or self.config['compute_od_demand_loss'])
             for j in seq:
                 one_data_dict = self._get_one_data(j)
                 car_grad, truck_grad, tmp_loss, tmp_loss_dict, dta, x_e_car, x_e_truck, tt_e_car, tt_e_truck, O_demand = self.compute_path_flow_grad_and_loss(one_data_dict, f_car, f_truck)
@@ -2364,6 +2469,7 @@ class PostProcessing:
                  estimated_car_cost=None, estimated_truck_cost=None,
                  link_length=None,
                  estimated_origin_demand=None,
+                 estimated_od_demand=None,
                  result_folder=None):
         self.dode = dode
         self.dta = dta
@@ -2394,6 +2500,9 @@ class PostProcessing:
         self.r2_origin_vehicle_registration = "NA"
         self.true_origin_vehicle_registration, self.estimated_origin_vehicle_registration = None, None
         self.estimated_origin_demand = estimated_origin_demand
+
+        self.r2_od_demand = "NA"
+        self.true_od_demand, self.estimated_od_demand = None, estimated_od_demand
         
         plt.rc('font', size=20)          # controls default text sizes
         plt.rc('axes', titlesize=20)     # fontsize of the axes title
@@ -2553,7 +2662,7 @@ class PostProcessing:
             self.true_origin_vehicle_registration = self.one_data_dict['origin_vehicle_registration_data']
 
             if self.estimated_origin_demand is None:
-                O_demand_est = self.dode.aggregate_f(self.f_car, self.f_truck)
+                O_demand_est = self.dode.aggregate_f_to_O_demand(self.f_car, self.f_truck)
             else:
                 O_demand_est = self.estimated_origin_demand
             # pandas DataFrame
@@ -2567,14 +2676,46 @@ class PostProcessing:
             self.estimated_origin_vehicle_registration['car'] = self.estimated_origin_vehicle_registration.apply(lambda row: process_one_row_car(row), axis=1)
             self.estimated_origin_vehicle_registration['truck'] = self.estimated_origin_vehicle_registration.apply(lambda row: process_one_row_truck(row), axis=1)
             
-            self.true_origin_vehicle_registration['car'] = self.true_origin_vehicle_registration['car'] * self.dode.config['origin_registration_data_car_weight']
-            self.true_origin_vehicle_registration['truck'] = self.true_origin_vehicle_registration['truck'] * self.dode.config['origin_registration_data_truck_weight']
+            # self.true_origin_vehicle_registration['car'] = self.true_origin_vehicle_registration['car'] * self.dode.config['origin_registration_data_car_weight']
+            # self.true_origin_vehicle_registration['truck'] = self.true_origin_vehicle_registration['truck'] * self.dode.config['origin_registration_data_truck_weight']
             self.true_origin_vehicle_registration = self.true_origin_vehicle_registration.loc[:, ['car', 'truck']].sum(axis=1)
 
-            self.estimated_origin_vehicle_registration['car'] = self.estimated_origin_vehicle_registration['car'] * self.dode.config['origin_registration_data_car_weight']
-            self.estimated_origin_vehicle_registration['truck'] = self.estimated_origin_vehicle_registration['truck'] * self.dode.config['origin_registration_data_truck_weight']
+            # self.estimated_origin_vehicle_registration['car'] = self.estimated_origin_vehicle_registration['car'] * self.dode.config['origin_registration_data_car_weight']
+            # self.estimated_origin_vehicle_registration['truck'] = self.estimated_origin_vehicle_registration['truck'] * self.dode.config['origin_registration_data_truck_weight']
             self.estimated_origin_vehicle_registration = self.estimated_origin_vehicle_registration.loc[:, ['car', 'truck']].sum(axis=1)
+        
+        if self.dode.config['use_od_demand_data']:
+            assert(self.f_car is not None and self.f_truck is not None)
+            # pandas DataFrame
+            self.true_od_demand = self.one_data_dict['od_demand_data']
+
+            if self.estimated_od_demand is None:
+                # dictinory
+                OD_demand_est = self.dode.aggregate_f_to_OD_demand(self.f_car, self.f_truck)
+            else:
+                OD_demand_est = self.estimated_od_demand.copy()
+
+            # pandas DataFrame
+            self.estimated_od_demand = self.true_od_demand.copy()
+            self.estimated_od_demand['car'] = 0.
+            self.estimated_od_demand['truck'] = 0.
+            def process_one_row_car(row):
+                return OD_demand_est[(row['origin_ID'], row['destination_ID'])][0]
+            def process_one_row_truck(row):
+                return OD_demand_est[(row['origin_ID'], row['destination_ID'])][1]
+            self.estimated_od_demand['car'] = self.estimated_od_demand.apply(lambda row: process_one_row_car(row), axis=1)
+            self.estimated_od_demand['truck'] = self.estimated_od_demand.apply(lambda row: process_one_row_truck(row), axis=1)
             
+            # self.true_od_demand['car'] = self.true_od_demand['car'] * self.dode.config['od_demand_data_car_weight']
+            # self.true_od_demand['truck'] = self.true_od_demand['truck'] * self.dode.config['od_demand_data_truck_weight']
+            self.true_od_demand = self.true_od_demand.loc[:, ['car', 'truck']].apply(lambda row: row['car'] + row['truck'], axis=1)
+            self.true_od_demand = np.hstack(self.true_od_demand.to_list())
+
+            # self.estimated_od_demand['car'] = self.estimated_od_demand['car'] * self.dode.config['od_demand_data_car_weight']
+            # self.estimated_od_demand['truck'] = self.estimated_od_demand['truck'] * self.dode.config['od_demand_data_truck_weight']
+            self.estimated_od_demand = self.estimated_od_demand.loc[:, ['car', 'truck']].apply(lambda row: row['car'] + row['truck'], axis=1)
+            self.estimated_od_demand = np.hstack(self.estimated_od_demand.to_list())
+
         self.observed_link_list = self.dode.observed_links[self.one_data_dict['mask_driving_link'][:len(self.dode.observed_links)]]
 
     def cal_r2_count(self):
@@ -2602,18 +2743,26 @@ class PostProcessing:
             print('----- origin vehicle registration data count -----')
             self.r2_origin_vehicle_registration = r2_score(self.true_origin_vehicle_registration, self.estimated_origin_vehicle_registration)
 
-        print("r2 count --- r2_car_count: {}, r2_truck_count: {}, r2_origin_vehicle_registration: {}"
+        if self.dode.config['use_od_demand_data']:
+            print('----- od demand data count -----')
+            print(self.true_od_demand)
+            print(self.estimated_od_demand)
+            print('----- od demand data count -----')
+            self.r2_od_demand = r2_score(self.true_od_demand, self.estimated_od_demand)
+
+        print("r2 count --- r2_car_count: {}, r2_truck_count: {}, r2_origin_vehicle_registration: {}, r2_od_demand: {}"
             .format(
                 self.r2_car_count,
                 self.r2_truck_count,
-                self.r2_origin_vehicle_registration
+                self.r2_origin_vehicle_registration,
+                self.r2_od_demand
                 ))
         
         return self.r2_car_count, self.r2_truck_count, self.r2_origin_vehicle_registration
 
     def scatter_plot_count(self, fig_name =  'link_flow_scatterplot_pathflow.png'):
-        if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data']:
-            n = self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data']
+        if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data'] + self.dode.config['use_od_demand_data'] > 0:
+            n = self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data'] + self.dode.config['use_od_demand_data']
             fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
 
             i = 0
@@ -2662,6 +2811,22 @@ class PostProcessing:
                 axes[0, i].set_ylim([0, m_max])
                 axes[0, i].set_box_aspect(1)
                 axes[0, i].text(0, 1, 'r2 = {:.3f}'.format(self.r2_origin_vehicle_registration),
+                            horizontalalignment='left',
+                            verticalalignment='top',
+                            transform=axes[0, i].transAxes)
+                
+            i += self.dode.config['use_origin_vehicle_registration_data']
+
+            if self.dode.config['use_od_demand_data']:
+                m_max = int(np.max((np.max(self.true_od_demand), np.max(self.estimated_od_demand))) + 1)
+                axes[0, i].scatter(self.true_od_demand, self.estimated_od_demand, color = self.color_list[i], marker = self.marker_list[i], s = 100)
+                axes[0, i].plot(range(m_max + 1), range(m_max + 1), color = 'gray')
+                axes[0, i].set_ylabel('Estimated OD demand')
+                axes[0, i].set_xlabel('True OD demand')
+                axes[0, i].set_xlim([0, m_max])
+                axes[0, i].set_ylim([0, m_max])
+                axes[0, i].set_box_aspect(1)
+                axes[0, i].text(0, 1, 'r2 = {:.3f}'.format(self.r2_od_demand),
                             horizontalalignment='left',
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
