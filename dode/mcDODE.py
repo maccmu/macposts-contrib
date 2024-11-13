@@ -93,8 +93,8 @@ class torch_pathflow_solver(nn.Module):
 
         self.num_assign_interval = num_assign_interval
 
-        self.car_scale = car_scale
-        self.truck_scale = truck_scale 
+        self.car_scale = car_scale if car_scale is not None else 1.
+        self.truck_scale = truck_scale if truck_scale is not None else 1.
 
         self.num_path = num_path
 
@@ -124,9 +124,17 @@ class torch_pathflow_solver(nn.Module):
         log_f_car, log_f_truck = None, None
 
         if use_file_as_init is not None:
-            # log f numpy
-            _, _, _, _, log_f_car, log_f_truck, _, _,\
-                _, _, _, _, _ = pickle.load(open(use_file_as_init, 'rb'))
+            if use_file_as_init.split(os.sep)[-1] == 'init_path_flow.pkl':
+                (log_f_car, log_f_truck) = pickle.load(open(use_file_as_init, 'rb'))
+                assert(np.all(log_f_car >= 0) and np.all(log_f_truck >= 0))
+                # inverse of softplus, default threshold of nn.Softplus is 20
+                log_f_car = np.where(np.log(np.exp(log_f_car) - 1) < 20., np.log(np.exp(log_f_car) - 1), log_f_car)
+                log_f_truck = np.where(np.log(np.exp(log_f_truck) - 1) < 20., np.log(np.exp(log_f_truck) - 1), log_f_truck)
+                self.car_scale, self.truck_scale = 1., 1.
+            else:
+                # log f numpy
+                _, _, _, _, log_f_car, log_f_truck, _, _,\
+                    _, _, _, _, _ = pickle.load(open(use_file_as_init, 'rb'))
 
         if log_f_car is None:
             self.log_f_car = nn.Parameter(self.init_tensor(torch.Tensor(self.num_assign_interval * self.num_path, 1)).squeeze(), requires_grad=True)
@@ -664,7 +672,7 @@ class MCDODE():
 
         return car_ltg_matrix, truck_ltg_matrix
 
-    def init_demand_vector(self, num_assign_interval, num_col, scale=1):
+    def init_demand_vector(self, num_assign_interval, num_col, scale=1, dist_type='uniform'):
         
         if type(scale) == np.ndarray:
             if scale.ndim == 1:
@@ -672,10 +680,10 @@ class MCDODE():
                 scale = scale[np.newaxis, :]
             else:
                 assert((scale.shape[0] == 1) & (scale.shape[1] == num_col))
-        # uniform
-        d = np.random.rand(num_assign_interval, num_col) * scale
-        # normal
-        # d = np.random.normal(0, 1, (num_assign_interval, num_col)) * 0.1 * scale + scale
+        if dist_type == 'uniform':
+            d = np.random.rand(num_assign_interval, num_col) * scale
+        elif dist_type == 'normal':
+            d = np.random.normal(0, 1, (num_assign_interval, num_col)) * 0.1 * scale + scale
 
         d = d.flatten(order='C')
 
@@ -690,12 +698,12 @@ class MCDODE():
         # d = d.astype(float)
         return d
 
-    def init_path_flow(self, car_scale=1, truck_scale=0.1):
+    def init_path_flow(self, car_scale=1, truck_scale=0.1, dist_type='uniform'):
         if car_scale is None or truck_scale is None:
             car_scale, truck_scale = self.estimate_path_flow_scale()
 
-        f_car = self.init_demand_vector(self.num_assign_interval, self.num_path, car_scale) 
-        f_truck = self.init_demand_vector(self.num_assign_interval, self.num_path, truck_scale) 
+        f_car = self.init_demand_vector(self.num_assign_interval, self.num_path, car_scale, dist_type) 
+        f_truck = self.init_demand_vector(self.num_assign_interval, self.num_path, truck_scale, dist_type) 
 
         f_car = np.maximum(f_car, 1e-6)
         f_truck = np.maximum(f_truck, 1e-6)
@@ -823,7 +831,7 @@ class MCDODE():
             f_truck_grad += self.config['origin_vehicle_registration_weight'] * f_truck_grad_add
 
         if self.config['use_od_demand_data']:
-            f_car_grad_add, f_truck_grad_add, _ = self._compute_grad_on_od_demand_data(one_data_dict, f_car, f_truck, od_demand_factor=1.0)
+            f_car_grad_add, f_truck_grad_add, _ = self._compute_grad_on_od_demand_data(one_data_dict, f_car, f_truck, od_demand_factor=self.config['od_demand_factor'])
             f_car_grad += self.config['od_demand_weight'] * f_car_grad_add
             f_truck_grad += self.config['od_demand_weight'] * f_truck_grad_add
 
@@ -1354,8 +1362,8 @@ class MCDODE():
 
     def _compute_grad_on_od_demand_data(self, one_data_dict, f_car, f_truck, od_demand_factor=1.0):
         # reshape car_flow and truck_flow into ndarrays with dimensions of intervals x number of total paths
-        f_car = torch.from_numpy(f_car)
-        f_truck = torch.from_numpy(f_truck)
+        f_car = torch.from_numpy(f_car).float()
+        f_truck = torch.from_numpy(f_truck).float()
         f_car.requires_grad = True
         f_truck.requires_grad = True
 
@@ -1376,10 +1384,15 @@ class MCDODE():
 
                 # pandas DataFrame
         def process_one_row(row):
+            car = torch.from_numpy(row['car']).float()
+            truck = torch.from_numpy(row['truck']).float()
+            car.requires_grad = False
+            truck.requires_grad = False
+            # loss = self.config['od_demand_data_car_weight'] * sum((OD_demand_est[(row['origin_ID'], row['destination_ID'])][0] - od_demand_factor * car)**2) + \
+            #        self.config['od_demand_data_truck_weight'] * sum((OD_demand_est[(row['origin_ID'], row['destination_ID'])][1] - od_demand_factor * truck)**2) 
 
-            loss = self.config['od_demand_data_car_weight'] * sum((OD_demand_est[(row['origin_ID'], row['destination_ID'])][0] - od_demand_factor * row['car'])**2) + \
-                   self.config['od_demand_data_truck_weight'] * sum((OD_demand_est[(row['origin_ID'], row['destination_ID'])][1] - od_demand_factor * row['truck'])**2) 
-
+            loss = sum((OD_demand_est[(row['origin_ID'], row['destination_ID'])][0] + OD_demand_est[(row['origin_ID'], row['destination_ID'])][1] 
+                        - od_demand_factor * car - od_demand_factor * truck)**2)
             loss.backward()
 
         one_data_dict['od_demand_data'].apply(lambda row: process_one_row(row), axis=1)
@@ -1502,8 +1515,10 @@ class MCDODE():
         if self.config['use_od_demand_data'] or self.config['compute_od_demand_loss']:
             OD_demand_est = self.aggregate_f_to_OD_demand(f_car, f_truck)
             def process_one_row(row):
-                return np.linalg.norm(OD_demand_est[(row['origin_ID'], row['destination_ID'])][0] - row['car'])**2 + \
-                       np.linalg.norm(OD_demand_est[(row['origin_ID'], row['destination_ID'])][1] - row['truck'])**2
+                # return np.linalg.norm(OD_demand_est[(row['origin_ID'], row['destination_ID'])][0] - row['car'])**2 + \
+                #        np.linalg.norm(OD_demand_est[(row['origin_ID'], row['destination_ID'])][1] - row['truck'])**2
+                return np.linalg.norm(OD_demand_est[(row['origin_ID'], row['destination_ID'])][0] + OD_demand_est[(row['origin_ID'], row['destination_ID'])][1]
+                                      - self.config['od_demand_factor'] * row['car'] - self.config['od_demand_factor'] * row['truck'])**2 
             loss = np.sqrt(np.nansum(one_data_dict['od_demand_data'].apply(lambda row: process_one_row(row), axis=1)))
             loss_dict['od_demand_loss'] = loss
 
@@ -1559,13 +1574,16 @@ class MCDODE():
         best_x_e_car, best_x_e_truck, best_tt_e_car, best_tt_e_truck, best_O_demand = 0, 0, 0, 0, 0
         # here the basic variables to be estimated are path flows, not OD demand, so no route choice model, unlike in sDODE.py
         if use_file_as_init is not None:
-            # most recent
-            _, _, loss_list, best_epoch, _, _, _, _, \
-                _, _, _, _, _ = pickle.load(open(use_file_as_init, 'rb'))
-            # best 
-            use_file_as_init = os.path.join(store_folder, '{}_iteration.pickle'.format(best_epoch))
-            _, _, _, _, best_log_f_car, best_log_f_truck, best_f_car, best_f_truck, \
-                best_x_e_car, best_x_e_truck, best_tt_e_car, best_tt_e_truck, best_O_demand = pickle.load(open(use_file_as_init, 'rb'))
+            if use_file_as_init.split(os.sep)[-1] == 'init_path_flow.pkl':
+                pass
+            else:
+                # most recent
+                _, _, loss_list, best_epoch, _, _, _, _, \
+                    _, _, _, _, _ = pickle.load(open(use_file_as_init, 'rb'))
+                # best 
+                use_file_as_init = os.path.join(store_folder, '{}_iteration.pickle'.format(best_epoch))
+                _, _, _, _, best_log_f_car, best_log_f_truck, best_f_car, best_f_truck, \
+                    best_x_e_car, best_x_e_truck, best_tt_e_car, best_tt_e_truck, best_O_demand = pickle.load(open(use_file_as_init, 'rb'))
 
         assert((len(loss_list) >= best_epoch) and (starting_epoch >= best_epoch))
 
@@ -1583,7 +1601,8 @@ class MCDODE():
             seq = np.random.permutation(self.num_data)
             loss = float(0)
             # print("Start iteration", time.time())
-            loss_dict = {'car_count_loss': 0.0, 'truck_count_loss': 0.0, 'car_tt_loss': 0.0, 'truck_tt_loss': 0.0, 'origin_vehicle_registration_loss': 0.0}
+            loss_dict = {'car_count_loss': 0.0, 'truck_count_loss': 0.0, 'car_tt_loss': 0.0, 'truck_tt_loss': 0.0, 
+                         'origin_vehicle_registration_loss': 0.0, 'od_demand_loss': 0.0}
 
             self.config['link_car_flow_weight'] = link_car_flow_weight[i] * (self.config['use_car_link_flow'] or self.config['compute_car_link_flow_loss'])
             self.config['link_truck_flow_weight'] = link_truck_flow_weight[i] * (self.config['use_truck_link_flow'] or self.config['compute_truck_link_flow_loss'])
@@ -1726,6 +1745,8 @@ class MCDODE():
         # here the basic variables to be estimated are path flows, not OD demand, so no route choice model, unlike in sDODE.py
         if use_file_as_init is None:
             (f_car, f_truck) = self.init_path_flow(car_scale=car_init_scale, truck_scale=truck_init_scale)
+        elif use_file_as_init.split(os.sep)[-1] == 'init_path_flow.pkl':
+            (f_car, f_truck) = pickle.load(open(use_file_as_init, 'rb'))
         else:
             # most recent
             _, _, loss_list, best_epoch, _, _, \
@@ -1771,7 +1792,8 @@ class MCDODE():
             seq = np.random.permutation(self.num_data)
             loss = float(0)
             # print("Start iteration", time.time())
-            loss_dict = {'car_count_loss': 0.0, 'truck_count_loss': 0.0, 'car_tt_loss': 0.0, 'truck_tt_loss': 0.0, 'origin_vehicle_registration_loss': 0.0}
+            loss_dict = {'car_count_loss': 0.0, 'truck_count_loss': 0.0, 'car_tt_loss': 0.0, 'truck_tt_loss': 0.0, 
+                         'origin_vehicle_registration_loss': 0.0, 'od_demand_loss': 0.0}
 
             self.config['link_car_flow_weight'] = link_car_flow_weight[i] * (self.config['use_car_link_flow'] or self.config['compute_car_link_flow_loss'])
             self.config['link_truck_flow_weight'] = link_truck_flow_weight[i] * (self.config['use_truck_link_flow'] or self.config['compute_truck_link_flow_loss'])
@@ -1905,6 +1927,8 @@ class MCDODE():
         # here the basic variables to be estimated are path flows, not OD demand, so no route choice model, unlike in sDODE.py
         if use_file_as_init is None:
             (f_car, f_truck) = self.init_path_flow(car_scale=car_init_scale, truck_scale=truck_init_scale)
+        elif use_file_as_init.split(os.sep)[-1] == 'init_path_flow.pkl':
+            (f_car, f_truck) = pickle.load(open(use_file_as_init, 'rb'))
         else:
             # most recent
             _, _, loss_list, best_epoch, _, _, \
@@ -1925,7 +1949,8 @@ class MCDODE():
             seq = np.random.permutation(self.num_data)
             loss = float(0)
             # print("Start iteration", time.time())
-            loss_dict = {'car_count_loss': 0.0, 'truck_count_loss': 0.0, 'car_tt_loss': 0.0, 'truck_tt_loss': 0.0, 'origin_vehicle_registration_loss': 0.0}
+            loss_dict = {'car_count_loss': 0.0, 'truck_count_loss': 0.0, 'car_tt_loss': 0.0, 'truck_tt_loss': 0.0, 
+                         'origin_vehicle_registration_loss': 0.0, 'od_demand_loss': 0.0}
 
             self.config['link_car_flow_weight'] = link_car_flow_weight[i] * (self.config['use_car_link_flow'] or self.config['compute_car_link_flow_loss'])
             self.config['link_truck_flow_weight'] = link_truck_flow_weight[i] * (self.config['use_truck_link_flow'] or self.config['compute_truck_link_flow_loss'])
@@ -2004,6 +2029,8 @@ class MCDODE():
         # here the basic variables to be estimated are path flows, not OD demand, so no route choice model, unlike in sDODE.py
         if use_file_as_init is None:
             (f_car, f_truck) = self.init_path_flow(car_scale=car_init_scale, truck_scale=truck_init_scale)
+        elif use_file_as_init.split(os.sep)[-1] == 'init_path_flow.pkl':
+            (f_car, f_truck) = pickle.load(open(use_file_as_init, 'rb'))
         else:
             # most recent
             _, _, loss_list, best_epoch, _, _, \
@@ -2110,6 +2137,8 @@ class MCDODE():
         # here the basic variables to be estimated are path flows, not OD demand, so no route choice model, unlike in sDODE.py
         if use_file_as_init is None:
             (f_car, f_truck) = self.init_path_flow(car_scale=car_init_scale, truck_scale=truck_init_scale)
+        elif use_file_as_init.split(os.sep)[-1] == 'init_path_flow.pkl':
+            (f_car, f_truck) = pickle.load(open(use_file_as_init, 'rb'))
         else:
             # most recent
             _, _, loss_list, best_epoch, _, _, \
@@ -2417,6 +2446,8 @@ class mcSPSA():
                          adagrad=False, delta_car_scale=0.1, delta_truck_scale=0.01):
     if use_file_as_init is None:
       (f_car, f_truck) = self.init_path_flow(car_scale=car_init_scale, truck_scale=truck_init_scale)
+    elif use_file_as_init.split(os.sep)[-1] == 'init_path_flow.pkl':
+      (f_car, f_truck) = pickle.load(open(use_file_as_init, 'rb'))
     else:
       (f_car, f_truck, _) = pickle.load(open(use_file_as_init, 'rb'))
     loss_list = list()
@@ -2697,24 +2728,23 @@ class PostProcessing:
 
             # pandas DataFrame
             self.estimated_od_demand = self.true_od_demand.copy()
-            self.estimated_od_demand['car'] = 0.
-            self.estimated_od_demand['truck'] = 0.
             def process_one_row_car(row):
                 return OD_demand_est[(row['origin_ID'], row['destination_ID'])][0]
             def process_one_row_truck(row):
                 return OD_demand_est[(row['origin_ID'], row['destination_ID'])][1]
             self.estimated_od_demand['car'] = self.estimated_od_demand.apply(lambda row: process_one_row_car(row), axis=1)
             self.estimated_od_demand['truck'] = self.estimated_od_demand.apply(lambda row: process_one_row_truck(row), axis=1)
-            
-            # self.true_od_demand['car'] = self.true_od_demand['car'] * self.dode.config['od_demand_data_car_weight']
-            # self.true_od_demand['truck'] = self.true_od_demand['truck'] * self.dode.config['od_demand_data_truck_weight']
-            self.true_od_demand = self.true_od_demand.loc[:, ['car', 'truck']].apply(lambda row: row['car'] + row['truck'], axis=1)
-            self.true_od_demand = np.hstack(self.true_od_demand.to_list())
 
-            # self.estimated_od_demand['car'] = self.estimated_od_demand['car'] * self.dode.config['od_demand_data_car_weight']
-            # self.estimated_od_demand['truck'] = self.estimated_od_demand['truck'] * self.dode.config['od_demand_data_truck_weight']
-            self.estimated_od_demand = self.estimated_od_demand.loc[:, ['car', 'truck']].apply(lambda row: row['car'] + row['truck'], axis=1)
-            self.estimated_od_demand = np.hstack(self.estimated_od_demand.to_list())
+            self.estimated_od_demand = self.estimated_od_demand['car'] + self.estimated_od_demand['truck']
+            self.estimated_od_demand = np.hstack(self.estimated_od_demand.to_list()) + 1e-6
+
+            # self.true_od_demand = self.true_od_demand['car'] * self.dode.config['od_demand_factor'] + self.true_od_demand['truck'] * self.dode.config['od_demand_factor']
+            # self.true_od_demand = np.hstack(self.true_od_demand.to_list())
+
+            self.true_od_demand = self.true_od_demand['car'] + self.true_od_demand['truck']
+            self.true_od_demand = np.vstack(self.true_od_demand.to_list()) + 1e-6
+            self.true_od_demand *= self.estimated_od_demand.reshape(self.true_od_demand.shape[0], -1) / self.true_od_demand
+            self.true_od_demand = self.true_od_demand.flatten(order='C')
 
         self.observed_link_list = self.dode.observed_links[self.one_data_dict['mask_driving_link'][:len(self.dode.observed_links)]]
 
@@ -2760,7 +2790,7 @@ class PostProcessing:
         
         return self.r2_car_count, self.r2_truck_count, self.r2_origin_vehicle_registration
 
-    def scatter_plot_count(self, fig_name =  'link_flow_scatterplot_pathflow.png'):
+    def scatter_plot_count(self, fig_name='link_flow_scatterplot_pathflow.png'):
         if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data'] + self.dode.config['use_od_demand_data'] > 0:
             n = self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_origin_vehicle_registration_data'] + self.dode.config['use_od_demand_data']
             fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
@@ -2834,8 +2864,9 @@ class PostProcessing:
             plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
+            plt.close()
 
-    def scatter_plot_count_by_link(self, link_list=None, fig_name =  'link_flow_scatterplot_pathflow_by_link'):
+    def scatter_plot_count_by_link(self, link_list=None, fig_name= 'link_flow_scatterplot_pathflow_by_link'):
         if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow']:
             if link_list is None:
                 link_list = self.observed_link_list
@@ -2849,6 +2880,9 @@ class PostProcessing:
             n = self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow']
 
             for li, link in enumerate(link_list):
+                if np.sum(np.array(self.observed_link_list) == link) == 0:
+                    print("Link {} is not in the observed link list.".format(link))
+                    continue
                 fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
                 i = 0
                 
@@ -2891,6 +2925,7 @@ class PostProcessing:
                 plt.savefig(os.path.join(self.result_folder, fig_name + "_{}.png".format(link)), bbox_inches='tight')
 
                 plt.show()
+                plt.close()
 
     def cal_r2_cost(self):
         if self.dode.config['use_car_link_tt']:
@@ -2954,7 +2989,7 @@ class PostProcessing:
 
         return self.r2_car_speed, self.r2_truck_speed
 
-    def scatter_plot_cost(self, fig_name = 'link_cost_scatterplot_pathflow.png'):
+    def scatter_plot_cost(self, fig_name='link_cost_scatterplot_pathflow.png'):
         if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
             n = self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']
             fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
@@ -3000,8 +3035,9 @@ class PostProcessing:
             plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             plt.show()
+            plt.close()
 
-    def scatter_plot_cost_by_link(self, link_list = None, fig_name = 'link_cost_scatterplot_pathflow_by_link'):
+    def scatter_plot_cost_by_link(self, link_list=None, fig_name='link_cost_scatterplot_pathflow_by_link'):
         if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
             if link_list is None:
                 link_list = self.dode.observed_links
@@ -3015,12 +3051,15 @@ class PostProcessing:
             n = self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']
             
             for li, link in enumerate(link_list):
+                if np.sum(np.array(self.observed_link_list) == link) == 0:
+                    print("Link {} is not in the observed link list.".format(link))
+                    continue
                 fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
                 i = 0
 
                 if self.dode.config['use_car_link_tt']:
-                    link_true_car_cost = true_car_cost[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
-                    link_estimated_car_cost = estimated_car_cost[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
+                    link_true_car_cost = true_car_cost[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_car_cost = estimated_car_cost[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
                     ind = ~(np.isinf(link_true_car_cost) + np.isinf(link_estimated_car_cost) + np.isnan(link_true_car_cost) + np.isnan(link_estimated_car_cost))
                     car_tt_min = np.min((np.min(link_true_car_cost[ind]), np.min(link_estimated_car_cost[ind]))) - 1 if any(ind) else 0
                     car_tt_max = np.max((np.max(link_true_car_cost[ind]), np.max(link_estimated_car_cost[ind]))) + 1 if any(ind) else 80
@@ -3039,8 +3078,8 @@ class PostProcessing:
                 i += self.dode.config['use_car_link_tt']
 
                 if self.dode.config['use_truck_link_tt']:
-                    link_true_truck_cost = true_truck_cost[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
-                    link_estimated_truck_cost = estimated_truck_cost[:, np.where(np.array(self.dode.observed_links) == link)[0][0]]
+                    link_true_truck_cost = true_truck_cost[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_truck_cost = estimated_truck_cost[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
                     ind = ~(np.isinf(link_true_truck_cost) + np.isinf(link_estimated_truck_cost) + np.isnan(link_true_truck_cost) + np.isnan(link_estimated_truck_cost))
                     truck_tt_min = np.min((np.min(link_true_truck_cost[ind]), np.min(link_estimated_truck_cost[ind]))) - 1 if any(ind) else 0
                     truck_tt_max = np.max((np.max(link_true_truck_cost[ind]), np.max(link_estimated_truck_cost[ind]))) + 1 if any(ind) else 80
@@ -3058,9 +3097,10 @@ class PostProcessing:
 
                 plt.savefig(os.path.join(self.result_folder, fig_name + "_{}.png".format(link)), bbox_inches='tight')
 
-                # plt.show()
+                plt.show()
+                plt.close()
 
-    def scatter_plot_speed(self, fig_name = 'link_speed_scatterplot_pathflow.png'):
+    def scatter_plot_speed(self, fig_name='link_speed_scatterplot_pathflow.png'):
 
         if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
             n = self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']
@@ -3108,7 +3148,110 @@ class PostProcessing:
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
 
-            if not axes.flat:
-                plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
-                plt.show()
+            plt.show()
+            plt.close()
+
+    def scatter_plot_speed_by_link(self, link_list=None, fig_name='link_speed_scatterplot_pathflow_by_link'):
+        if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
+            if link_list is None:
+                link_list = self.dode.observed_links
+            if self.dode.config['use_car_link_tt']:
+                true_car_speed = self.true_car_speed.reshape(self.dode.num_assign_interval, -1) 
+                estimated_car_speed = self.estimated_car_speed.reshape(self.dode.num_assign_interval, -1) 
+            if self.dode.config['use_truck_link_tt']:
+                true_truck_speed = self.true_truck_speed.reshape(self.dode.num_assign_interval, -1) 
+                estimated_truck_speed = self.estimated_truck_speed.reshape(self.dode.num_assign_interval, -1) 
+
+            n = self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']
+            n_actual = 0
+            for li, link in enumerate(link_list):
+                if np.sum(np.array(self.observed_link_list) == link) == 0:
+                    print("Link {} is not in the observed link list.".format(link))
+                    continue
+                fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
+                i = 0
+
+                if self.dode.config['use_car_link_tt']:
+                    link_true_car_speed = true_car_speed[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_car_speed = estimated_car_speed[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    ind = ~(np.isinf(link_true_car_speed) + np.isinf(link_estimated_car_speed) + np.isnan(link_true_car_speed) + np.isnan(link_estimated_car_speed))
+                    if sum(ind) > 0:
+                        car_speed_min = np.min((np.min(link_true_car_speed[ind]), np.min(link_estimated_car_speed[ind]))) - 1
+                        car_speed_max = np.max((np.max(link_true_car_speed[ind]), np.max(link_estimated_car_speed[ind]))) + 1
+                        axes[0, i].scatter(link_true_car_speed[ind], link_estimated_car_speed[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
+                        axes[0, i].plot(np.linspace(car_speed_min, car_speed_max, 20), np.linspace(car_speed_min, car_speed_max, 20), color = 'gray')
+                        axes[0, i].set_ylabel('Estimated observed link speed for car')
+                        axes[0, i].set_xlabel('True observed link speed for car')
+                        axes[0, i].set_xlim([car_speed_min, car_speed_max])
+                        axes[0, i].set_ylim([car_speed_min, car_speed_max])
+                        axes[0, i].set_box_aspect(1)
+                        axes[0, i].text(0, 1, 'link {}, car speed r2 = {:.3f}'.format(link, r2_score(link_true_car_speed[ind], link_estimated_car_speed[ind]) if any(ind) else 0.),
+                                    horizontalalignment='left',
+                                    verticalalignment='top',
+                                    transform=axes[0, i].transAxes)
+                        n_actual += 1
+                    else:
+                        print(f"No valid data for link {link} for car speed.")
+
+                i += self.dode.config['use_car_link_tt']
+
+                if self.dode.config['use_truck_link_tt']:
+                    link_true_truck_speed = true_truck_speed[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_truck_speed = estimated_truck_speed[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    ind = ~(np.isinf(link_true_truck_speed) + np.isinf(link_estimated_truck_speed) + np.isnan(link_true_truck_speed) + np.isnan(link_estimated_truck_speed))
+                    if sum(ind) > 0:
+                        truck_speed_min = np.min((np.min(link_true_truck_speed[ind]), np.min(link_estimated_truck_speed[ind]))) - 1 if any(ind) else 0
+                        truck_speed_max = np.max((np.max(link_true_truck_speed[ind]), np.max(link_estimated_truck_speed[ind]))) + 1 if any(ind) else 80
+                        axes[0, i].scatter(link_true_truck_speed[ind], link_estimated_truck_speed[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
+                        axes[0, i].plot(np.linspace(truck_speed_min, truck_speed_max, 20), np.linspace(truck_speed_min, truck_speed_max, 20), color = 'gray')
+                        axes[0, i].set_ylabel('Estimated observed travel speed for truck')
+                        axes[0, i].set_xlabel('True observed travel speed for truck')
+                        axes[0, i].set_xlim([truck_speed_min, truck_speed_max])
+                        axes[0, i].set_ylim([truck_speed_min, truck_speed_max])
+                        axes[0, i].set_box_aspect(1)
+                        axes[0, i].text(0, 1, 'link {}, truck speed r2 = {:.3f}'.format(link, r2_score(link_true_truck_speed[ind], link_estimated_truck_speed[ind]) if any(ind) else 0.),
+                                    horizontalalignment='left',
+                                    verticalalignment='top',
+                                    transform=axes[0, i].transAxes)
+                        n_actual += 1
+                    else:
+                        print(f"No valid data for link {link} for truck speed.")                       
+
+                if n_actual > 0:
+                    plt.savefig(os.path.join(self.result_folder, fig_name + "_{}.png".format(link)), bbox_inches='tight')
+
+                    plt.show()
+                    plt.close()
+
+
+# def r2_score(y_true, y_pred):
+#     # Check if inputs are numpy arrays, if not, convert them
+#     y_true = np.asarray(y_true)
+#     y_pred = np.asarray(y_pred)
+    
+#     # Check if y_true and y_pred are of the same length
+#     if y_true.shape[0] != y_pred.shape[0]:
+#         raise ValueError("y_true and y_pred must have the same length.")
+    
+#     # Check for empty input
+#     if y_true.size == 0 or y_pred.size == 0:
+#         raise ValueError("y_true and y_pred must not be empty.")
+    
+#     # Calculate the mean of y_true
+#     y_mean = np.mean(y_true)
+    
+#     # Calculate the total sum of squares (variance of y_true)
+#     total_sum_of_squares = np.sum((y_true - y_mean) ** 2)
+    
+#     # Handle case where y_true has no variance (all values are the same)
+#     if total_sum_of_squares == 0:
+#         return 1.0 if np.array_equal(y_true, y_pred) else 0.0
+    
+#     # Calculate the residual sum of squares
+#     residual_sum_of_squares = np.sum((y_true - y_pred) ** 2)
+    
+#     # Calculate R^2
+#     r2_score = 1 - (residual_sum_of_squares / total_sum_of_squares)
+#     return r2_score
