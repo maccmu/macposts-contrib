@@ -723,7 +723,7 @@ class MNM_network_builder():
       ffs = float(words[3])
       cap = float(words[4])
       rhoj = float(words[5])
-      lanes = int(words[6])
+      lanes = int(float(words[6]))
       l = MNM_dlink(ID, length, typ, ffs, cap, rhoj, lanes)
       l.is_ok()
       link_list.append(l)

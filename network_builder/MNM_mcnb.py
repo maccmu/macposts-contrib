@@ -1041,7 +1041,7 @@ class MNM_network_builder():
             ffs_car = float(words[3])
             cap_car = float(words[4])
             rhoj_car = float(words[5])
-            lanes = int(words[6])
+            lanes = int(float(words[6]))
             ffs_truck = float(words[7])
             cap_truck = float(words[8])
             rhoj_truck = float(words[9])
