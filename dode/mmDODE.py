@@ -972,28 +972,27 @@ class MMDODE:
         # print('+++++++++++++++++++++++++++++++++++++ test DAR +++++++++++++++++++++++++++++++++++++')
 
         # if use scaled loss, i.e., modify the weights
-        # if 'use_scaled_loss' in self.config:
-        # if self.config['use_scaled_loss']:
-        if True:
-            if not init_loss:
-                _, init_loss = self._get_loss(one_data_dict, dta)
+        if 'use_scaled_loss' in self.config:
+            if self.config['use_scaled_loss']:
+                if not init_loss:
+                    _, init_loss = self._get_loss(one_data_dict, dta)
 
-            if self.config['use_car_link_flow']:
-                self.config['link_car_flow_weight'] = self.config['link_car_flow_weight'] / init_loss['car_count_loss']
-            if self.config['use_truck_link_flow']:
-                self.config['link_truck_flow_weight'] = self.config['link_truck_flow_weight'] / init_loss['truck_count_loss']
-            if self.config['use_passenger_link_flow']:
-                self.config['link_passenger_flow_weight'] = self.config['link_passenger_flow_weight'] / init_loss['passenger_count_loss']
-            if self.config['use_bus_link_flow']:
-                self.config['link_bus_flow_weight'] = self.config['link_bus_flow_weight'] / init_loss['bus_count_loss']
-            if self.config['use_car_link_tt']:
-                self.config['link_car_tt_weight'] = self.config['link_car_tt_weight'] / init_loss['car_tt_loss']
-            if self.config['use_truck_link_tt']:
-                self.config['link_truck_tt_weight'] = self.config['link_truck_tt_weight'] / init_loss['truck_tt_loss']
-            if self.config['use_passenger_link_tt']:
-                self.config['link_passenger_tt_weight'] = self.config['link_passenger_tt_weight'] / init_loss['passenger_tt_loss']
-            if self.config['use_bus_link_tt']:
-                self.config['link_bus_tt_weight'] = self.config['link_bus_tt_weight'] / init_loss['bus_tt_loss']
+                if self.config['use_car_link_flow']:
+                    self.config['link_car_flow_weight'] = self.config['link_car_flow_weight'] / init_loss['car_count_loss']
+                if self.config['use_truck_link_flow']:
+                    self.config['link_truck_flow_weight'] = self.config['link_truck_flow_weight'] / init_loss['truck_count_loss']
+                if self.config['use_passenger_link_flow']:
+                    self.config['link_passenger_flow_weight'] = self.config['link_passenger_flow_weight'] / init_loss['passenger_count_loss']
+                if self.config['use_bus_link_flow']:
+                    self.config['link_bus_flow_weight'] = self.config['link_bus_flow_weight'] / init_loss['bus_count_loss']
+                if self.config['use_car_link_tt']:
+                    self.config['link_car_tt_weight'] = self.config['link_car_tt_weight'] / init_loss['car_tt_loss']
+                if self.config['use_truck_link_tt']:
+                    self.config['link_truck_tt_weight'] = self.config['link_truck_tt_weight'] / init_loss['truck_tt_loss']
+                if self.config['use_passenger_link_tt']:
+                    self.config['link_passenger_tt_weight'] = self.config['link_passenger_tt_weight'] / init_loss['passenger_tt_loss']
+                if self.config['use_bus_link_tt']:
+                    self.config['link_bus_tt_weight'] = self.config['link_bus_tt_weight'] / init_loss['bus_tt_loss']
 
 
         # derivative of count loss with respect to link flow
@@ -3720,8 +3719,7 @@ class MMDODE:
 
                 # use OD loss or not
                 eps = 1e-8
-                # if self.config['use_OD_loss']:
-                if False:
+                if self.config['use_OD_loss']:
                     q_grad_car_driving += (q_e_mode_driving - q_driving_in_loss) / (np.linalg.norm(q_e_mode_driving - q_driving_in_loss) + eps) * ODloss_weight
                     q_grad_car_pnr += (q_e_mode_pnr - q_pnr_in_loss) / (np.linalg.norm(q_e_mode_pnr - q_pnr_in_loss) + eps) * ODloss_weight
                     q_truck_grad += (q_e_truck - q_truck_in_loss) / (np.linalg.norm(q_e_truck - q_truck_in_loss) + eps) * ODloss_weight
@@ -3780,7 +3778,7 @@ class MMDODE:
                     self.update_path_table(dta, use_tdsp)
                     f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr = \
                         self.update_path_flow(f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr,
-                                              car_driving_scale, truck_driving_scale, passenger_bustransit_scale, car_pnr_scale) # xm: there are problems with these scales
+                                              car_driving_scale, truck_driving_scale, passenger_bustransit_scale, car_pnr_scale) # xm: there might be problems with these scales
                     dta = 0
 
                 # update demand 
@@ -4561,7 +4559,7 @@ class PostProcessing:
             axes[0, i].scatter(true_q_e_mode_driving[ind], q_e_mode_driving[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
             axes[0, i].plot(range(m_max + 1), range(m_max + 1), color = 'gray')
             axes[0, i].set_ylabel('Estimated driving demand')
-            axes[0, i].set_xlabel('Observed driving demand')
+            axes[0, i].set_xlabel('True driving demand')
             axes[0, i].set_xlim([0, m_max])
             axes[0, i].set_ylim([0, m_max])
             axes[0, i].text(0, 1, 'r2 = {}'.format(r2_score(true_q_e_mode_driving[ind], q_e_mode_driving[ind])),
@@ -4575,8 +4573,8 @@ class PostProcessing:
             m_max = int(np.max((np.max(true_q_e_mode_bustransit[ind]), np.max(q_e_mode_bustransit[ind]))) + 1)
             axes[0, i].scatter(true_q_e_mode_bustransit[ind], q_e_mode_bustransit[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
             axes[0, i].plot(range(m_max + 1), range(m_max + 1), color = 'gray')
-            axes[0, i].set_ylabel('Estimated passenger demand')
-            axes[0, i].set_xlabel('Observed passenger demand')
+            axes[0, i].set_ylabel('Estimated transit passenger demand')
+            axes[0, i].set_xlabel('True transit passenger demand')
             axes[0, i].set_xlim([0, m_max])
             axes[0, i].set_ylim([0, m_max])
             axes[0, i].text(0, 1, 'r2 = {}'.format(r2_score(true_q_e_mode_bustransit[ind], q_e_mode_bustransit[ind])),
@@ -4590,8 +4588,8 @@ class PostProcessing:
             m_max = int(np.max((np.max(true_q_e_mode_pnr[ind]), np.max(q_e_mode_pnr[ind]))) + 1)
             axes[0, i].scatter(true_q_e_mode_pnr[ind], q_e_mode_pnr[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
             axes[0, i].plot(range(m_max + 1), range(m_max + 1), color = 'gray')
-            axes[0, i].set_ylabel('Estimated pnr demand')
-            axes[0, i].set_xlabel('Observed pnr demand')
+            axes[0, i].set_ylabel('Estimated PNR demand')
+            axes[0, i].set_xlabel('True PNR demand')
             axes[0, i].set_xlim([0, m_max])
             axes[0, i].set_ylim([0, m_max])
             axes[0, i].text(0, 1, 'r2 = {}'.format(r2_score(true_q_e_mode_pnr[ind], q_e_mode_pnr[ind])),
