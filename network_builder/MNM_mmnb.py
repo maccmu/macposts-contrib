@@ -5,7 +5,7 @@ import networkx as nx
 from bidict import bidict
 from collections import OrderedDict
 from scipy.sparse import coo_matrix
-
+import shutil
 import macposts
 
 from MNM_mcnb import MNM_dlink, MNM_dnode, MNM_graph, MNM_path, MNM_pathset, MNM_pathtable
@@ -80,6 +80,7 @@ class MNM_demand_bus():
         self.demand_dict = dict()
         self.demand_list = None
         self.path_flow_matrix = list()
+        self.route_demand = dict()
 
     def add_demand(self, O, D, route_ID, bus_demand, overwriting=False):
         # check if bus_demand is a 1D np.ndarray
@@ -96,6 +97,7 @@ class MNM_demand_bus():
                 self.demand_dict[O][D] = dict()
             # demand of each OD pair is a np.array
             self.demand_dict[O][D][route_ID] = bus_demand
+            self.route_demand[route_ID] = sum(bus_demand)
 
     def build_from_file(self, file_name):
         self.demand_list = list()
@@ -565,6 +567,12 @@ class MNM_busstop_virtual():
 
     def generate_text(self):
         return ' '.join([str(e) for e in [self.virtual_busstop_ID, self.physical_busstop_ID, self.route_ID]])
+    
+    def get_virtual_busstop_ID(self):
+        return int(self.virtual_busstop_ID)
+    
+    def get_route_ID(self):
+        return int(self.route_ID)
 
 
 class MNM_bus_route():
@@ -1201,6 +1209,7 @@ class MNM_config():
             'adaptive_ratio_passenger': float,
             'adaptive_ratio_car': float,
             'adaptive_ratio_truck': float,
+            'adaptive_ratio_pnr': float,
             'routing_type': str, 
 
             'bus_capacity': int,
@@ -1208,6 +1217,13 @@ class MNM_config():
             'fixed_dwell_time': float,
             'boarding_time_per_passenger': float,
             'alighting_time_per_passenger': float,
+
+            'has_metro': int,
+            'metro_capacity': int,
+            'metro_boarding_lost_time': float,
+            'metro_fixed_dwell_time': float,
+            'metro_boarding_time_per_passenger': float,
+            'metro_alighting_time_per_passenger': float,
 
             'explicit_bus': int,
             'historical_bus_waiting_time': int,
@@ -1966,7 +1982,8 @@ class MNM_network_builder():
                         total_passenger_demand_file_name = 'passenger_demand', emission_link_file_name='MNM_input_emission_linkID',
                         link_toll_file_name='MNM_input_link_toll',
                         link_td_attribute_file_name='MNM_input_link_td_attribute',
-                        node_td_cost_file_name='MNM_input_node_td_cost'):
+                        node_td_cost_file_name='MNM_input_node_td_cost',
+                        metro_ids_file_name='metro_ids'):
         if not os.path.isdir(folder_path):
             os.makedirs(folder_path)
 
@@ -2005,6 +2022,10 @@ class MNM_network_builder():
         f = open(os.path.join(folder_path, config_file_name), 'w')
         f.write(str(self.config))
         f.close()
+
+        if self.config.config_dict['DTA']['has_metro']:
+            src_file = os.path.join(self.folder_path, metro_ids_file_name)
+            shutil.copy(src_file, folder_path)
 
         # python 2
         # f = open(os.path.join(folder_path, bus_link_file_name), 'wb')

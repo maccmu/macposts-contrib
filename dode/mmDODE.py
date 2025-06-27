@@ -8,14 +8,20 @@ import time
 import shutil
 import scipy
 from scipy.sparse import coo_matrix, csr_matrix, eye
+import scipy.sparse.linalg as spla
+from scipy.optimize import lsq_linear
 import pickle
 import multiprocessing as mp
 from typing import Union
 import torch
 import torch.nn as nn
 import pandas as pd
-# from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score
 import re
+import copy
+import gurobipy as gp
+from gurobipy import GRB
+
 matches = [s for s in plt.style.available if re.search(r"seaborn.*poster", s)]
 assert(len(matches) > 0)
 plt_style = matches[0]
@@ -259,6 +265,9 @@ class MMDODE:
         self.observed_links_bus = self.config['observed_links_bus']
         self.observed_links_walking = self.config['observed_links_walking']
 
+        # observed stops_veh tuple list
+        self.observed_stops_vehs_list = self.config['observed_stops_vehs_list']
+
         # observed path IDs, np.array
         self.paths_list = self.config['paths_list']
         self.paths_list_driving = self.config['paths_list_driving']
@@ -361,6 +370,37 @@ class MMDODE:
                 is_updated = 0
                 is_bus_walking_link_covered = np.concatenate((is_bus_link_covered, is_walking_link_covered))
         return is_updated, is_driving_link_covered, is_bus_walking_link_covered
+    
+    def check_stops_covered_by_transit_paths(self):
+        walking_link_id2node = dict()
+        for link in self.nb.link_walking_list:
+            walking_link_id2node[link.ID] = set()
+            walking_link_id2node[link.ID].add(link.from_node_ID)
+            walking_link_id2node[link.ID].add(link.to_node_ID)
+
+        bus_link_id2stop = dict()
+        for link in self.nb.link_bus_list:
+            bus_link_id2stop[link.ID] = set()
+            bus_link_id2stop[link.ID].add(link.from_busstop_ID)
+            bus_link_id2stop[link.ID].add(link.to_busstop_ID)
+
+        stopsORnodes_involved_in_transit_paths = set()
+        for path_id in self.nb.path_table_bustransit.ID2path:
+            path = self.nb.path_table_bustransit.ID2path[path_id]
+            for link_id in path.link_list:
+                if link_id in walking_link_id2node:
+                    stopsORnodes_involved_in_transit_paths.update(walking_link_id2node[link_id])
+                else:
+                    stopsORnodes_involved_in_transit_paths.update(bus_link_id2stop[link_id])
+        
+        is_observed_stops_vehs_covered = np.array([False] * len(self.config['observed_stops_vehs_list']))
+        for idx in range(len(self.config['observed_stops_vehs_list'])):
+            tup = self.config['observed_stops_vehs_list'][idx]
+            if tup[0] in stopsORnodes_involved_in_transit_paths:
+                is_observed_stops_vehs_covered[idx] = True
+
+        return is_observed_stops_vehs_covered
+
         
     def _add_car_link_flow_data(self, link_flow_df_list):
         # assert(self.config['use_car_link_flow'])
@@ -402,6 +442,14 @@ class MMDODE:
         assert (self.num_data == len(link_spd_df_list))
         self.data_dict['passenger_link_tt'] = link_spd_df_list
 
+    def _add_veh_run_boarding_alighting_data(self, veh_run_boarding_alighting_record_list):
+        assert (self.num_data == len(veh_run_boarding_alighting_record_list))
+        self.data_dict['veh_run_boarding_alighting_record'] = veh_run_boarding_alighting_record_list
+
+    def _add_stop_arrival_departure_travel_time_data(self, stop_arrival_departure_travel_time_record_list):
+        assert (self.num_data == len(stop_arrival_departure_travel_time_record_list))
+        self.data_dict['stop_arrival_departure_travel_time'] = stop_arrival_departure_travel_time_record_list
+
     def add_data(self, data_dict):
         if self.config['car_count_agg']:
             self.car_count_agg_L_list = data_dict['car_count_agg_L_list']
@@ -430,6 +478,11 @@ class MMDODE:
         if self.config['use_passenger_link_tt']or self.config['compute_passenger_link_tt_loss']:
             self._add_passenger_link_tt_data(data_dict['passenger_link_tt'])
 
+        if self.config['use_veh_run_boarding_alighting'] or self.config['compute_veh_run_boarding_alighting_loss'] or self.config['use_ULP_f_transit']:
+            self._add_veh_run_boarding_alighting_data(data_dict['veh_run_boarding_alighting_record'])
+            if 'stop_arrival_departure_travel_time' in data_dict:
+                self._add_stop_arrival_departure_travel_time_data(data_dict['stop_arrival_departure_travel_time'])
+
         if 'mask_driving_link' in data_dict:
             self.data_dict['mask_driving_link'] = np.tile(data_dict['mask_driving_link'], self.num_assign_interval)
         else:
@@ -444,6 +497,11 @@ class MMDODE:
             self.data_dict['mask_walking_link'] = np.tile(data_dict['mask_walking_link'], self.num_assign_interval)
         else:
             self.data_dict['mask_walking_link'] = np.ones(len(self.observed_links_walking) * self.num_assign_interval, dtype=bool)
+
+        if 'mask_observed_stops_vehs_record' in data_dict:
+            self.data_dict['mask_observed_stops_vehs_record'] = data_dict['mask_observed_stops_vehs_record']
+        else:
+            self.data_dict['mask_observed_stops_vehs_record'] = np.ones(len(self.observed_stops_vehs_list), dtype=bool)
 
     def save_simulation_input_files(self, folder_path, f_car_driving=None, f_truck_driving=None, 
                                     f_passenger_bustransit=None, f_car_pnr=None, f_bus=None, 
@@ -688,7 +746,10 @@ class MMDODE:
         passenger_dar_matrix_pnr_bus_link = csr_matrix((self.num_assign_interval * len(self.observed_links_bus), 
                                                         self.num_assign_interval * len(self.paths_list_pnr)))                     
         passenger_bus_link_flow_relationship = 0
-        
+
+        passenger_BoardingAlighting_dar_transit = csr_matrix((len(self.observed_stops_vehs_list), len(self.paths_list_bustransit)*self.num_assign_interval))
+        passenger_BoardingAlighting_dar_pnr = csr_matrix((len(self.observed_stops_vehs_list), len(self.paths_list_pnr)*self.num_assign_interval))
+
         if self.config['use_car_link_flow'] or self.config['use_car_link_tt']:
             car_dar_matrix_driving = self.get_car_dar_matrix_driving(dta, f_car_driving)
             if car_dar_matrix_driving.max() == 0.:
@@ -740,10 +801,172 @@ class MMDODE:
 
         if (self.config['use_passenger_link_flow'] or self.config['use_passenger_link_tt']) and (self.config['use_bus_link_flow'] or self.config['use_bus_link_tt']):
             passenger_bus_link_flow_relationship = self.get_passenger_bus_link_flow_relationship(dta)
-            
+
+        if self.config['use_veh_run_boarding_alighting'] or self.config['use_ULP_f_transit']:
+            raw_bt_dar = dta.get_sparse_dar_matrix_bt_by_round()
+            raw_pnr_dar = dta.get_sparse_dar_matrix_pnr_by_round()
+            passenger_BoardingAlighting_dar_transit, passenger_BoardingAlighting_dar_pnr = self._massage_raw_boarding_alighting_dar(raw_bt_dar, raw_pnr_dar, f_passenger_bustransit, f_car_pnr)
+            if passenger_BoardingAlighting_dar_transit.max() == 0.:
+                print("passenger_BoardingAlighting_dar_transit is empty!")
+            if passenger_BoardingAlighting_dar_pnr.max() == 0.:
+                print("passenger_BoardingAlighting_dar_pnr is empty!")
+
         return car_dar_matrix_driving, truck_dar_matrix_driving, car_dar_matrix_pnr, bus_dar_matrix_transit_link, bus_dar_matrix_driving_link, \
                passenger_dar_matrix_bustransit, passenger_dar_matrix_pnr, car_dar_matrix_bus_driving_link, truck_dar_matrix_bus_driving_link, passenger_dar_matrix_bustransit_bus_link, passenger_dar_matrix_pnr_bus_link, \
-               passenger_bus_link_flow_relationship
+               passenger_bus_link_flow_relationship, passenger_BoardingAlighting_dar_transit, passenger_BoardingAlighting_dar_pnr
+
+    def get_stop_arrival_departure_travel_time(self, raw_boarding_alighting_record):
+        df = pd.DataFrame(raw_boarding_alighting_record, columns=['arrival_time', 'bus_id', 'route_id', 'veh_order', 'stop_id', 'boarding_count', 'alighting_count', 'departure_time'])
+        df['veh_order'] = df['veh_order'].astype(int)
+        df['route_id'] = df['route_id'].astype(int)
+        df['stop_id'] = df['stop_id'].astype(int)
+        df = df[['route_id', 'veh_order', 'stop_id', 'arrival_time', 'departure_time']]
+
+        rows = []
+        for id in self.nb.path_table_bus.ID2path:
+            bus_route = self.nb.path_table_bus.ID2path[id]
+            route_id = bus_route.route_ID
+            for i in range(len(bus_route.virtual_busstop_list)):
+                stop_id = bus_route.virtual_busstop_list[i]
+                sequence = i+1
+                rows.append({'route_id': route_id, 'stop_id': stop_id, 'sequence': sequence})
+        bus_stop_sequence_df = pd.DataFrame(rows)
+
+        predicted = pd.merge(df, bus_stop_sequence_df, how='inner', on=['route_id', 'stop_id'])
+        predicted.sort_values(by=['route_id', 'veh_order','sequence'], inplace=True)
+        predicted.reset_index(inplace=True, drop=True)
+
+        predicted['pure_travel_time'] = np.nan
+        predicted['travel_and_dwell_time'] = np.nan
+        grouped = predicted.groupby(['route_id', 'veh_order'])
+        predicted['next_arrival_time'] = grouped['arrival_time'].shift(-1)  # last recorded stop in that trip has np.nan
+        predicted['pure_travel_time'] = predicted['next_arrival_time'] - predicted['departure_time']
+        predicted['travel_and_dwell_time'] = predicted['next_arrival_time'] - predicted['arrival_time']
+        predicted.drop(columns=['next_arrival_time'], inplace=True)
+
+        predicted['pure_travel_time'] = predicted['pure_travel_time'] * self.nb.config.config_dict['DTA']['unit_time'] / 60 # convert to minutes
+        predicted['travel_and_dwell_time'] = predicted['travel_and_dwell_time'] * self.nb.config.config_dict['DTA']['unit_time'] / 60
+
+        return predicted # note: here are all stops and all veh runs as long as it once arrives at a stop, not only observed ones
+
+
+    def _massage_boarding_alighting_record(self, raw_boarding_alighting_record):
+        # with open('raw_boarding_alighting_record.pkl', 'wb') as f:
+        #     pickle.dump(raw_boarding_alighting_record, f)
+
+        full_boarding_alighting_record_dict = dict()
+        for stop in self.nb.busstop_virtual_list:
+            stop_id = stop.get_virtual_busstop_ID()
+            route_id = stop.get_route_ID()
+            num_veh_runs = int(self.nb.demand_bus.route_demand[route_id])
+            for i in range(num_veh_runs):
+                key_tuple = (stop_id, i+1, 'board')
+                full_boarding_alighting_record_dict[key_tuple] = 0
+                key_tuple = (stop_id, i+1, 'alight')
+                full_boarding_alighting_record_dict[key_tuple] = 0
+        for record in raw_boarding_alighting_record:
+            stop_id = int(record[4])
+            veh_order = int(record[3])
+            boarding_count = record[5]
+            alighting_count = record[6]
+            key_tuple = (stop_id, veh_order, 'board')      
+            full_boarding_alighting_record_dict[key_tuple] += boarding_count
+            key_tuple = (stop_id, veh_order, 'alight')
+            full_boarding_alighting_record_dict[key_tuple] += alighting_count
+
+        full_boarding_alighting_record = (list(full_boarding_alighting_record_dict.keys()),np.array(list(full_boarding_alighting_record_dict.values())))
+        # self.full_boarding_alighting_record = full_boarding_alighting_record
+
+        full_key_index_map = {tup: idx for idx, tup in enumerate(full_boarding_alighting_record[0])}
+        indices = [full_key_index_map[tup] for tup in self.observed_stops_vehs_list]
+        simulated_boarding_alighting_count_array = full_boarding_alighting_record[1][indices]
+
+        simulated_boarding_alighting_record_for_observed = (self.observed_stops_vehs_list, simulated_boarding_alighting_count_array)
+
+        # with open('simulated_boarding_alighting_record_for_observed.pkl', 'wb') as f:
+        #     pickle.dump(simulated_boarding_alighting_record_for_observed, f)
+
+        return simulated_boarding_alighting_record_for_observed
+
+
+    def _massage_raw_boarding_alighting_dar(self, raw_bt_dar, raw_pnr_dar, f_transit, f_pnr):
+        # with open('raw_dar.pkl', 'wb') as f:
+        #     pickle.dump((raw_bt_dar, raw_pnr_dar), f)
+        # with open('f_transit.pkl', 'wb') as f:
+        #     pickle.dump(f_transit, f)
+
+        if raw_bt_dar[0].shape[0] == 0:
+            print("No raw_bt_dar. Consider increase the demand values")
+
+        if raw_pnr_dar[0].shape[0] == 0:
+            print("No raw_pnr_dar. Consider increase the demand values")
+
+        # transit 
+        transit_dar_col_tuple_list = []
+        for assign_interval in range(self.num_assign_interval):
+            for path_id in self.nb.path_table_bustransit.ID2path:
+                transit_dar_col_tuple_list.append((path_id, assign_interval))
+        
+        # pnr 
+        pnr_dar_col_tuple_list = []
+        for assign_interval in range(self.num_assign_interval):
+            for path_id in self.nb.path_table_pnr.ID2path:
+                pnr_dar_col_tuple_list.append((path_id, assign_interval))
+
+        # transit dar
+        transit_dar_row_tuple_list_with_values = [raw_bt_dar[3][idx] for idx in raw_bt_dar[0]]
+        transit_dar_col_tuple_list_with_values = [raw_bt_dar[4][idx] for idx in raw_bt_dar[1]]
+        transit_dar_values_array = raw_bt_dar[2]
+        col_index_map = {tup: idx for idx, tup in enumerate(transit_dar_col_tuple_list)}
+        row_index_map = {tup: idx for idx, tup in enumerate(self.observed_stops_vehs_list)}
+        transit_dar_row_indices = []
+        transit_dar_col_indices = []
+        transit_dar_values = []
+        for i in range(len(transit_dar_row_tuple_list_with_values)):
+            if transit_dar_row_tuple_list_with_values[i] in row_index_map:
+                transit_dar_row_indices.append(row_index_map[transit_dar_row_tuple_list_with_values[i]])
+                transit_dar_col_indices.append(col_index_map[transit_dar_col_tuple_list_with_values[i]])
+                transit_dar_values.append(transit_dar_values_array[i])
+        transit_dar_row_indices = np.array(transit_dar_row_indices)
+        transit_dar_col_indices = np.array(transit_dar_col_indices)
+        transit_dar_values = np.array(transit_dar_values) / f_transit[list(transit_dar_col_indices)]
+        # mask = transit_dar_values <= 2
+        # transit_dar_values = transit_dar_values[mask]
+        # transit_dar_row_indices = transit_dar_row_indices[mask]
+        # transit_dar_col_indices = transit_dar_col_indices[mask]
+        # transit_dar_values = np.minimum(transit_dar_values, 1)  # cap the values to 1
+        transit_dar = coo_matrix((transit_dar_values, (transit_dar_row_indices, transit_dar_col_indices)), shape=(len(self.observed_stops_vehs_list), len(transit_dar_col_tuple_list)))
+        transit_dar = transit_dar.tocsr()
+
+        # pnr dar
+        pnr_dar_row_tuple_list_with_values = [raw_pnr_dar[3][idx] for idx in raw_pnr_dar[0]]
+        pnr_dar_col_tuple_list_with_values = [raw_pnr_dar[4][idx] for idx in raw_pnr_dar[1]]
+        pnr_dar_values_array = raw_pnr_dar[2]
+        col_index_map = {tup: idx for idx, tup in enumerate(pnr_dar_col_tuple_list)}
+        pnr_dar_row_indices = []
+        pnr_dar_col_indices = []
+        pnr_dar_values = []
+        for i in range(len(pnr_dar_row_tuple_list_with_values)):
+            if pnr_dar_row_tuple_list_with_values[i] in row_index_map:
+                pnr_dar_row_indices.append(row_index_map[pnr_dar_row_tuple_list_with_values[i]])
+                pnr_dar_col_indices.append(col_index_map[pnr_dar_col_tuple_list_with_values[i]])
+                pnr_dar_values.append(pnr_dar_values_array[i])
+        pnr_dar_row_indices = np.array(pnr_dar_row_indices)
+        pnr_dar_col_indices = np.array(pnr_dar_col_indices)
+        pnr_dar_values = np.array(pnr_dar_values) / f_pnr[list(pnr_dar_col_indices)]
+        # mask = pnr_dar_values <= 2
+        # pnr_dar_values = pnr_dar_values[mask]
+        # pnr_dar_row_indices = pnr_dar_row_indices[mask]
+        # pnr_dar_col_indices = pnr_dar_col_indices[mask]
+        # pnr_dar_values = np.minimum(pnr_dar_values, 1)  # cap the values to 1
+        pnr_dar = coo_matrix((pnr_dar_values, (pnr_dar_row_indices, pnr_dar_col_indices)), shape=(len(self.observed_stops_vehs_list), len(pnr_dar_col_tuple_list)))
+        pnr_dar = pnr_dar.tocsr()
+
+        # with open('output_dar.pkl', 'wb') as f:
+        #     pickle.dump([transit_dar, pnr_dar], f)
+
+        return transit_dar, pnr_dar
+
 
     def _massage_raw_dar(self, raw_dar, ass_freq, f, num_assign_interval, paths_list, observed_links, num_procs=5):
         assert(raw_dar.shape[1] == 5)
@@ -945,7 +1168,7 @@ class MMDODE:
         # print("Getting DAR", time.time())
         car_dar_matrix_driving, truck_dar_matrix_driving, car_dar_matrix_pnr, bus_dar_matrix_transit_link, bus_dar_matrix_driving_link, \
                passenger_dar_matrix_bustransit, passenger_dar_matrix_pnr, car_dar_matrix_bus_driving_link, truck_dar_matrix_bus_driving_link, passenger_dar_matrix_bustransit_bus_link, passenger_dar_matrix_pnr_bus_link, \
-               passenger_bus_link_flow_relationship = \
+               passenger_bus_link_flow_relationship, passenger_BoardingAlighting_dar_transit, passenger_BoardingAlighting_dar_pnr = \
                    self.get_dar(dta, f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus, fix_bus=fix_bus)
         # print("Evaluating grad", time.time())
 
@@ -993,6 +1216,8 @@ class MMDODE:
                     self.config['link_passenger_tt_weight'] = self.config['link_passenger_tt_weight'] / init_loss['passenger_tt_loss']
                 if self.config['use_bus_link_tt']:
                     self.config['link_bus_tt_weight'] = self.config['link_bus_tt_weight'] / init_loss['bus_tt_loss']
+                if self.config['use_veh_run_boarding_alighting']:
+                    self.config['veh_run_boarding_alighting_weight'] = self.config['veh_run_boarding_alighting_weight'] / init_loss['veh_run_boarding_alighting_loss']
 
 
         # derivative of count loss with respect to link flow
@@ -1003,7 +1228,10 @@ class MMDODE:
         car_grad_for_bus = np.zeros(len(self.observed_links_bus_driving) * self.num_assign_interval)
         truck_grad_for_bus = np.zeros(len(self.observed_links_bus_driving) * self.num_assign_interval)
 
-        x_e_car, x_e_truck, x_e_passenger, x_e_bus = np.nan, np.nan, np.nan, np.nan
+        # derivative of passenger boarding and alighting loss with respect to boarding_alighting record
+        passenger_BoardingAlighting_grad = np.zeros(len(self.observed_stops_vehs_list))
+
+        x_e_car, x_e_truck, x_e_passenger, x_e_bus, x_e_BoardingAlighting_count, stop_arrival_departure_travel_time_df = np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
         
         if self.config['use_car_link_flow']:
             grad, x_e_car = self._compute_count_loss_grad_on_car_link_flow(dta, one_data_dict)
@@ -1017,6 +1245,10 @@ class MMDODE:
         if self.config['use_bus_link_flow']:
             grad, x_e_bus = self._compute_count_loss_grad_on_bus_link_flow(dta, one_data_dict)
             bus_grad += self.config['link_bus_flow_weight'] * grad
+        if self.config['use_veh_run_boarding_alighting'] or self.config['use_ULP_f_transit']:
+            grad, x_e_BoardingAlighting_count, stop_arrival_departure_travel_time_df = self._compute_BoardingAlighting_loss_grad_on_BoardingAlighting_record(dta, one_data_dict)
+            if self.config['use_veh_run_boarding_alighting']:
+                passenger_BoardingAlighting_grad += self.config['veh_run_boarding_alighting_weight'] * grad
 
             # car_grad_for_bus += self._compute_link_flow_grad_on_car_link_flow_for_bus(bus_grad)
             # truck_grad_for_bus += self._compute_link_flow_grad_on_truck_link_flow_for_bus(bus_grad)
@@ -1033,6 +1265,25 @@ class MMDODE:
         f_car_pnr_grad = car_dar_matrix_pnr.T.dot(car_grad)
         f_passenger_pnr_grad = passenger_dar_matrix_pnr.T.dot(passenger_grad)
         f_bus_grad = bus_dar_matrix_transit_link.T.dot(bus_grad) if not fix_bus else None # + (f_bus - self.nb.demand_bus.path_flow_matrix.flatten(order='F')) * 2
+
+        # derivative of boarding_alighting record with respect to path flow
+        if self.config['use_veh_run_boarding_alighting']:
+            f_passenger_bustransit_grad += passenger_BoardingAlighting_dar_transit.T.dot(passenger_BoardingAlighting_grad)
+            f_passenger_pnr_grad += passenger_BoardingAlighting_dar_pnr.T.dot(passenger_BoardingAlighting_grad)
+
+        if self.config['use_ULP_f_transit']:
+            # f_transit_ULP = spla.lsqr(passenger_BoardingAlighting_dar_transit, one_data_dict['veh_run_boarding_alighting_record'][1])[0] 
+            # f_transit_ULP = lsq_linear(passenger_BoardingAlighting_dar_transit, one_data_dict['veh_run_boarding_alighting_record'][1], bounds=(0, np.inf), max_iter=2).x
+            # f_transit_ULP = compute_ULP_f(passenger_BoardingAlighting_dar_transit, one_data_dict['veh_run_boarding_alighting_record'][1], 5e-1, 3000)
+            mask_record = one_data_dict['mask_observed_stops_vehs_record']
+            row_indices = np.where(mask_record)[0]
+            f_transit_ULP = compute_ULP_f_Gurobi(passenger_BoardingAlighting_dar_transit[row_indices], one_data_dict['veh_run_boarding_alighting_record'][1][mask_record])
+            if f_transit_ULP is None:
+                print("Warning: f_transit_ULP is None, update based on gradient")
+            else:
+                f_transit_ULP = np.maximum(f_transit_ULP, 1e-6)  
+        else:
+            f_transit_ULP = None
 
         # derivative of travel time loss with respect to link travel time
         car_grad = np.zeros(len(self.observed_links_driving) * self.num_assign_interval)
@@ -1091,6 +1342,21 @@ class MMDODE:
         # print("Getting Loss", time.time())
         total_loss, loss_dict = self._get_loss(one_data_dict, dta)
 
+        # also save the weighted loss for computation in hypothesis testing
+        loss_dict['car_count_loss_weighted'] = self.config['link_car_flow_weight'] * loss_dict['car_count_loss'] if self.config['use_car_link_flow'] else 0
+        loss_dict['truck_count_loss_weighted'] = self.config['link_truck_flow_weight'] * loss_dict['truck_count_loss'] if self.config['use_truck_link_flow'] else 0
+        loss_dict['bus_count_loss_weighted'] = self.config['link_bus_flow_weight'] * loss_dict['bus_count_loss'] if self.config['use_bus_link_flow'] else 0
+        loss_dict['passenger_count_loss_weighted'] = self.config['link_passenger_flow_weight'] * loss_dict['passenger_count_loss'] if self.config['use_passenger_link_flow'] else 0
+        loss_dict['car_tt_loss_weighted'] = self.config['link_car_tt_weight'] * loss_dict['car_tt_loss'] if self.config['use_car_link_tt'] else 0
+        loss_dict['truck_tt_loss_weighted'] = self.config['link_truck_tt_weight'] * loss_dict['truck_tt_loss'] if self.config['use_truck_link_tt'] else 0
+        loss_dict['bus_tt_loss_weighted'] = self.config['link_bus_tt_weight'] * loss_dict['bus_tt_loss'] if self.config['use_bus_link_tt'] else 0
+        loss_dict['passenger_tt_loss_weighted'] = self.config['link_passenger_tt_weight'] * loss_dict['passenger_tt_loss'] if self.config['use_passenger_link_tt'] else 0
+        loss_dict['veh_run_boarding_alighting_loss_weighted'] = self.config['veh_run_boarding_alighting_weight'] * loss_dict['veh_run_boarding_alighting_loss'] if self.config['use_veh_run_boarding_alighting'] else 0
+        loss_dict['total_loss_weighted'] = loss_dict['car_count_loss_weighted'] + loss_dict['truck_count_loss_weighted'] + \
+            loss_dict['bus_count_loss_weighted'] + loss_dict['passenger_count_loss_weighted'] + \
+            loss_dict['veh_run_boarding_alighting_loss_weighted'] + \
+            loss_dict['car_tt_loss_weighted'] + loss_dict['truck_tt_loss_weighted'] + loss_dict['bus_tt_loss_weighted'] + loss_dict['passenger_tt_loss_weighted']
+
         # _bound = 0.1
         # f_car_driving_grad, f_truck_driving_grad, f_passenger_bustransit_grad, f_car_pnr_grad, f_passenger_pnr_grad, f_bus_grad = \
         #     np.clip(f_car_driving_grad, -_bound, _bound), \
@@ -1098,10 +1364,47 @@ class MMDODE:
         #     np.clip(f_passenger_bustransit_grad, -_bound, _bound), \
         #     np.clip(f_car_pnr_grad, -_bound, _bound), \
         #     np.clip(f_passenger_pnr_grad, -_bound, _bound), \
-        #     np.clip(f_bus_grad, -_bound, _bound)    
+        #     np.clip(f_bus_grad, -_bound, _bound)   
+        # 
+
+        # below are for Jacobian matrices used in hypothesis testing
+        car_count_J_f_driving = car_dar_matrix_driving
+        # car_count_J_f_transit = np.zeros((car_dar_matrix_driving.shape[0], self.num_path_bustransit * self.num_assign_interval))
+        car_count_J_f_pnr = car_dar_matrix_pnr
+        temp_link_tt_grad_on_link_flow_car = self._compute_link_tt_grad_on_link_flow_car(dta)
+        car_time_J_f_driving = temp_link_tt_grad_on_link_flow_car.dot(car_dar_matrix_driving)
+        # car_time_J_f_transit = np.zeros((temp_link_tt_grad_on_link_flow_car.shape[0], self.num_path_bustransit * self.num_assign_interval))
+        car_time_J_f_pnr = temp_link_tt_grad_on_link_flow_car.dot(car_dar_matrix_pnr)
+        # BoardingAlightingCount_J_f_driving = np.zeros((len(self.observed_stops_vehs_list), self.num_path_driving * self.num_assign_interval))
+        BoardingAlightingCount_J_f_transit = passenger_BoardingAlighting_dar_transit
+        BoardingAlightingCount_J_f_pnr = passenger_BoardingAlighting_dar_pnr
+        Jacobian_dict = {
+            'car_count_J_f_driving': car_count_J_f_driving,
+            'car_count_J_f_pnr': car_count_J_f_pnr,
+            'car_time_J_f_driving': car_time_J_f_driving,
+            'car_time_J_f_pnr': car_time_J_f_pnr,
+            'BoardingAlightingCount_J_f_transit': BoardingAlightingCount_J_f_transit,
+            'BoardingAlightingCount_J_f_pnr': BoardingAlightingCount_J_f_pnr
+        }
+
 
         return f_car_driving_grad, f_truck_driving_grad, f_passenger_bustransit_grad, f_car_pnr_grad, f_passenger_pnr_grad, f_bus_grad, \
-               total_loss, loss_dict, dta, x_e_car, x_e_truck, x_e_passenger, x_e_bus, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus
+               total_loss, loss_dict, dta, x_e_car, x_e_truck, x_e_passenger, x_e_bus, x_e_BoardingAlighting_count, tt_e_car, tt_e_truck, tt_e_passenger, \
+               tt_e_bus, f_transit_ULP, stop_arrival_departure_travel_time_df, Jacobian_dict
+
+    def _compute_BoardingAlighting_loss_grad_on_BoardingAlighting_record(self, dta, one_data_dict):
+        observed_x_e_BoardingAlighting_count = one_data_dict['veh_run_boarding_alighting_record'][1]
+        raw_boarding_alighting_record = dta.get_bus_boarding_alighting_record()
+        simulated_boarding_alighting_record_for_observed = self._massage_boarding_alighting_record(raw_boarding_alighting_record)
+        x_e_BoardingAlighting_count = simulated_boarding_alighting_record_for_observed[1]
+        assert(len(x_e_BoardingAlighting_count) == len(observed_x_e_BoardingAlighting_count))
+        discrepancy = np.nan_to_num(observed_x_e_BoardingAlighting_count - x_e_BoardingAlighting_count)
+        grad = - discrepancy
+
+        stop_arrival_departure_travel_time_df = self.get_stop_arrival_departure_travel_time(raw_boarding_alighting_record)
+
+        return grad, x_e_BoardingAlighting_count, stop_arrival_departure_travel_time_df
+
 
     def _compute_count_loss_grad_on_car_link_flow(self, dta, one_data_dict):
         link_flow_array = one_data_dict['car_link_flow']
@@ -2084,6 +2387,11 @@ class MMDODE:
         if self.config['passenger_count_agg']:
             one_data_dict['passenger_count_agg_L'] = self.passenger_count_agg_L_list[j]
 
+        if self.config['use_veh_run_boarding_alighting'] or self.config['use_ULP_f_transit']:
+            one_data_dict['veh_run_boarding_alighting_record'] = self.data_dict['veh_run_boarding_alighting_record'][j]
+            if 'stop_arrival_departure_travel_time' in self.data_dict:
+                one_data_dict['stop_arrival_departure_travel_time'] = self.data_dict['stop_arrival_departure_travel_time'][j]
+
         if 'mask_driving_link' in self.data_dict:
             one_data_dict['mask_driving_link'] = self.data_dict['mask_driving_link']
         else:
@@ -2098,6 +2406,12 @@ class MMDODE:
             one_data_dict['mask_walking_link'] = self.data_dict['mask_walking_link']
         else:
             one_data_dict['mask_walking_link'] = np.ones(len(self.observed_links_walking) * self.num_assign_interval, dtype=bool)
+
+        if 'mask_observed_stops_vehs_record' in self.data_dict:
+            one_data_dict['mask_observed_stops_vehs_record'] = self.data_dict['mask_observed_stops_vehs_record']
+        else:
+            one_data_dict['mask_observed_stops_vehs_record'] = np.ones(len(self.observed_stops_vehs_list), dtype=bool)
+
         return one_data_dict
 
     def _get_loss(self, one_data_dict, dta):
@@ -2162,6 +2476,18 @@ class MMDODE:
             # loss = self.config['link_passenger_flow_weight'] * np.linalg.norm(np.nan_to_num(x_e[mask_passenger] - one_data_dict['passenger_link_flow'][mask_passenger]))
             loss = np.linalg.norm(np.nan_to_num(x_e[mask_passenger] - one_data_dict['passenger_link_flow'][mask_passenger]))
             loss_dict['passenger_count_loss'] = loss
+
+        if self.config['use_veh_run_boarding_alighting'] or self.config['compute_veh_run_boarding_alighting_loss']: 
+            observed_x_e_BoardingAlighting_count = one_data_dict['veh_run_boarding_alighting_record'][1]
+            raw_boarding_alighting_record = dta.get_bus_boarding_alighting_record()
+            simulated_boarding_alighting_record_for_observed = self._massage_boarding_alighting_record(raw_boarding_alighting_record)
+            x_e_BoardingAlighting_count = simulated_boarding_alighting_record_for_observed[1]
+            assert(len(x_e_BoardingAlighting_count) == len(observed_x_e_BoardingAlighting_count))
+            mask_record = one_data_dict['mask_observed_stops_vehs_record']
+            loss = np.linalg.norm(np.nan_to_num(x_e_BoardingAlighting_count[mask_record] - observed_x_e_BoardingAlighting_count[mask_record]))
+            loss_dict['veh_run_boarding_alighting_loss'] = loss
+
+
 
         # if self.config['use_bus_link_passenger_flow'] or self.config['compute_bus_link_passenger_flow_loss']:
         #     # num_links_bus x num_assign_intervals
@@ -3460,11 +3786,12 @@ class MMDODE:
                                     driving_step_size=0.1, bustransit_step_size = 0.1, pnr_step_size = 0.1, truck_step_size=0.01, bus_step_size=0.01,
                                     gamma_truck = 0.9, gamma_driving = 0.9, gamma_bustransit = 0.9, gamma_pnr = 0.9,
                                     link_car_flow_weight=1, link_truck_flow_weight=1, link_passenger_flow_weight=1, link_bus_flow_weight=1,
-                                    link_car_tt_weight=1, link_truck_tt_weight=1, link_passenger_tt_weight=1, link_bus_tt_weight=1, ODloss_weight=1,
+                                    link_car_tt_weight=1, link_truck_tt_weight=1, link_passenger_tt_weight=1, link_bus_tt_weight=1, ODloss_weight=1, veh_run_boarding_alighting_weight=1,
                                     max_epoch=100, algo="NAdam", fix_bus=True, column_generation=False, use_tdsp=False, explicit_bus=1,
                                     # alpha_mode=(1., 1.5, 2.), beta_mode=1, alpha_path=1, beta_path=1, 
                                     use_file_as_init=None, save_folder=None, starting_epoch=0, random_init=True,
-                                    q_driving_in_loss = None, q_truck_in_loss = None, q_bustransit_in_loss = None, q_pnr_in_loss = None):
+                                    q_driving_in_loss = None, q_truck_in_loss = None, q_bustransit_in_loss = None, q_pnr_in_loss = None,
+                                    use_seperate_optimizer = True):
         
         if save_folder is not None and not os.path.exists(save_folder):
             os.mkdir(save_folder)
@@ -3511,12 +3838,20 @@ class MMDODE:
         if np.isscalar(link_bus_tt_weight):
             link_bus_tt_weight = np.ones(max_epoch, dtype=bool) * link_bus_tt_weight
         assert(len(link_bus_tt_weight) == max_epoch)
+
+        if np.isscalar(ODloss_weight):
+            ODloss_weight = np.ones(max_epoch, dtype=bool) * ODloss_weight
+        assert(len(ODloss_weight) == max_epoch)
+
+        if np.isscalar(veh_run_boarding_alighting_weight):
+            veh_run_boarding_alighting_weight = np.ones(max_epoch, dtype=bool) * veh_run_boarding_alighting_weight
+        assert(len(veh_run_boarding_alighting_weight) == max_epoch)
         
         loss_list = list()
         best_epoch = starting_epoch
         best_q_e_truck, best_f_bus = 0, 0
         best_q_e_mode_driving, best_q_e_mode_bustransit, best_q_e_mode_pnr = 0, 0, 0
-        best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus = 0, 0, 0, 0, 0, 0, 0, 0
+        best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_x_e_BoardingAlighting_count, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus = 0, 0, 0, 0, 0, 0, 0, 0, 0
         # read from files as init values
         if use_file_as_init is not None:
             # most recent
@@ -3524,12 +3859,13 @@ class MMDODE:
                 _, \
                 _, _, _, \
                 _, _, _, _, _, \
-                _, _, _ , _, _, _, _, _ = pickle.load(open(use_file_as_init, 'rb'))
+                _, _, _ , _, _, _, _, _, _ , _= pickle.load(open(use_file_as_init, 'rb'))
             # best
             use_file_as_init = os.path.join(save_folder, '{}_iteration_estimate_demand.pickle'.format(best_epoch))
             _, _, _, _, best_q_e_truck, best_q_e_mode_driving, best_q_e_mode_bustransit, best_q_e_mode_pnr, \
                 _, _, _, _, best_f_bus, \
-                best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus \
+                best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_x_e_BoardingAlighting_count, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus,\
+                     best_stop_arrival_departure_travel_time_df \
                     = pickle.load(open(use_file_as_init, 'rb'))
 
             q_e_truck = best_q_e_truck
@@ -3625,14 +3961,6 @@ class MMDODE:
         if not fix_bus:
             f_bus_tensor.requires_grad = True
 
-        params = [
-            {'params': q_e_truck_tensor, 'lr': truck_step_size},
-            {'params': q_e_mode_driving_tensor, 'lr': driving_step_size},
-            {'params': q_e_mode_bustransit_tensor, 'lr': bustransit_step_size},
-            {'params': q_e_mode_pnr_tensor, 'lr': pnr_step_size}
-        ]
-        if not fix_bus:
-            params.append({'params': f_bus_tensor, 'lr': bus_step_size})
 
         algo_dict = {
             "SGD": torch.optim.SGD,
@@ -3644,14 +3972,36 @@ class MMDODE:
             "Adagrad": torch.optim.Adagrad,
             "Adadelta": torch.optim.Adadelta
         }
-        optimizer = algo_dict[algo](params)
 
-        schedulers = [
-            torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma_truck),
-            torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma_driving),
-            torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma_bustransit),
-            torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma_pnr)
-        ]
+        if use_seperate_optimizer:
+            optimizers = [
+                algo_dict[algo]([{'params': q_e_truck_tensor}], lr=truck_step_size),
+                algo_dict[algo]([{'params': q_e_mode_driving_tensor}], lr=driving_step_size),
+                algo_dict[algo]([{'params': q_e_mode_bustransit_tensor}], lr=bustransit_step_size),
+                algo_dict[algo]([{'params': q_e_mode_pnr_tensor}], lr=pnr_step_size)
+            ]
+
+            schedulers = [
+                torch.optim.lr_scheduler.ExponentialLR(optimizers[0], gamma=gamma_truck),
+                torch.optim.lr_scheduler.ExponentialLR(optimizers[1], gamma=gamma_driving),
+                torch.optim.lr_scheduler.ExponentialLR(optimizers[2], gamma=gamma_bustransit),
+                torch.optim.lr_scheduler.ExponentialLR(optimizers[3], gamma=gamma_pnr)
+            ]
+
+            if not fix_bus:
+                optimizers.append(algo_dict[algo]([{'params': f_bus_tensor}], lr=bus_step_size))
+                schedulers.append(torch.optim.lr_scheduler.ExponentialLR(optimizers[-1], gamma=0.9))
+        else:
+            params = [
+                    {'params': q_e_truck_tensor, 'lr': truck_step_size},
+                    {'params': q_e_mode_driving_tensor, 'lr': driving_step_size},
+                    {'params': q_e_mode_bustransit_tensor, 'lr': bustransit_step_size},
+                    {'params': q_e_mode_pnr_tensor, 'lr': pnr_step_size}
+                        ]
+            if not fix_bus:
+                params.append({'params': f_bus_tensor, 'lr': bus_step_size})
+            optimizers = [algo_dict[algo](params)]
+            schedulers = [torch.optim.lr_scheduler.ExponentialLR(optimizers[0], gamma=gamma_driving)] # if use single optimizer, use gamma_driving for all
 
         for i in range(max_epoch):
             seq = np.random.permutation(self.num_data)
@@ -3661,16 +4011,28 @@ class MMDODE:
                 "truck_count_loss": 0.,
                 "bus_count_loss": 0.,
                 "passenger_count_loss": 0.,
+                "veh_run_boarding_alighting_loss": 0.,
                 "car_tt_loss": 0.,
                 "truck_tt_loss": 0.,
                 "bus_tt_loss": 0.,
-                "passenger_tt_loss": 0.
+                "passenger_tt_loss": 0.,
+                "car_count_loss_weighted": 0.,
+                "truck_count_loss_weighted": 0.,
+                "bus_count_loss_weighted": 0.,
+                "passenger_count_loss_weighted": 0.,
+                "car_tt_loss_weighted": 0.,
+                "truck_tt_loss_weighted": 0.,
+                "bus_tt_loss_weighted": 0.,
+                "passenger_tt_loss_weighted": 0.,
+                "veh_run_boarding_alighting_loss_weighted": 0.,
+                "total_loss_weighted": 0.
             }
 
             self.config['link_car_flow_weight'] = link_car_flow_weight[i] * (self.config['use_car_link_flow'] or self.config['compute_car_link_flow_loss'])
             self.config['link_truck_flow_weight'] = link_truck_flow_weight[i] * (self.config['use_truck_link_flow'] or self.config['compute_truck_link_flow_loss'])
             self.config['link_passenger_flow_weight'] = link_passenger_flow_weight[i] * (self.config['use_passenger_link_flow'] or self.config['compute_passenger_link_flow_loss'])
             self.config['link_bus_flow_weight'] = link_bus_flow_weight[i] * (self.config['use_bus_link_flow'] or self.config['compute_bus_link_flow_loss'])
+            self.config['veh_run_boarding_alighting_weight'] = veh_run_boarding_alighting_weight[i] * (self.config['use_veh_run_boarding_alighting'] or self.config['compute_veh_run_boarding_alighting_loss'])
 
             self.config['link_car_tt_weight'] = link_car_tt_weight[i] * (self.config['use_car_link_tt'] or self.config['compute_car_link_tt_loss'])
             self.config['link_truck_tt_weight'] = link_truck_tt_weight[i] * (self.config['use_truck_link_tt'] or self.config['compute_truck_link_tt_loss'])
@@ -3699,6 +4061,9 @@ class MMDODE:
                 f_passenger_bustransit = np.maximum(f_passenger_bustransit, 1e-3 / self.nb.config.config_dict['DTA']['flow_scalar'])
                 f_car_pnr = np.maximum(f_car_pnr, 1e-3 / self.nb.config.config_dict['DTA']['flow_scalar'])
                 f_bus = np.maximum(f_bus, 1e-3 / self.nb.config.config_dict['DTA']['flow_scalar'])
+
+                if self.config['use_ULP_f_transit'] and i > 0 and f_transit_ULP is not None:
+                    f_passenger_bustransit = f_transit_ULP
                 
                 if loss_list:
                     init_loss = loss_list[0][1]
@@ -3706,9 +4071,10 @@ class MMDODE:
                     init_loss = None
                 # f_grad: num_path * num_assign_interval
                 f_car_driving_grad, f_truck_driving_grad, f_passenger_bustransit_grad, f_car_pnr_grad, f_passenger_pnr_grad, f_bus_grad, \
-                    tmp_loss, tmp_loss_dict, dta, x_e_car, x_e_truck, x_e_passenger, x_e_bus, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus = \
-                        self.compute_path_flow_grad_and_loss(one_data_dict, f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus, 
-                        fix_bus=fix_bus, counter=0, run_mmdta_adaptive=False, init_loss = init_loss, explicit_bus=explicit_bus, isUsingbymode = True)
+                    tmp_loss, tmp_loss_dict, dta, x_e_car, x_e_truck, x_e_passenger, x_e_bus, x_e_BoardingAlighting_count, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus,\
+                        f_transit_ULP, stop_arrival_departure_travel_time_df, _ = \
+                        self.compute_path_flow_grad_and_loss(one_data_dict, f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus = None if fix_bus else f_bus, 
+                        fix_bus=fix_bus, counter=0, run_mmdta_adaptive=False, init_loss = init_loss, explicit_bus=explicit_bus, isUsingbymode = False)
                 
                 # q_mode_grad: num_OD_one_mode * num_assign_interval
                 q_grad_car_driving = P_path_car_driving.T.dot(f_car_driving_grad)  # link_car_flow_weight, link_car_tt_weight
@@ -3726,7 +4092,8 @@ class MMDODE:
                     q_grad_passenger_bustransit += (q_e_mode_bustransit - q_bustransit_in_loss) / (np.linalg.norm(q_e_mode_bustransit - q_bustransit_in_loss) + eps) * ODloss_weight
                     # q_grad_passenger_pnr += (q_e_mode_pnr - q_pnr_in_loss) / (np.linalg.norm(q_e_mode_pnr - q_pnr_in_loss) + eps)
                 
-                optimizer.zero_grad()
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
 
                 q_e_truck_tensor.grad = torch.from_numpy(q_truck_grad)
                 q_e_mode_driving_tensor.grad = torch.from_numpy(q_grad_car_driving)
@@ -3737,14 +4104,17 @@ class MMDODE:
                 if not fix_bus:
                     f_bus_tensor.grad = torch.from_numpy(f_bus_grad)
 
-                optimizer.step()
+                for optimizer in optimizers:
+                    optimizer.step()
                 for scheduler in schedulers:
                     scheduler.step()
 
                 # release memory
                 f_car_driving_grad, f_truck_driving_grad, f_passenger_bustransit_grad, f_car_pnr_grad, f_passenger_pnr_grad, f_bus_grad = 0, 0, 0, 0, 0, 0
                 q_grad_car_driving, q_grad_car_pnr, q_truck_grad, q_grad_passenger_bustransit, q_grad_passenger_pnr = 0, 0, 0, 0, 0
-                optimizer.zero_grad()
+                
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
 
                 # q_e_passenger = q_e_passenger_tensor.data.cpu().numpy() * init_scale_passenger
                 q_e_truck = q_e_truck_tensor.data.cpu().numpy()
@@ -3752,10 +4122,22 @@ class MMDODE:
                 q_e_mode_bustransit = q_e_mode_bustransit_tensor.data.cpu().numpy()
                 q_e_mode_pnr = q_e_mode_pnr_tensor.data.cpu().numpy()
 
-
                 if not fix_bus:
                     f_bus = f_bus_tensor.data.cpu().numpy()
 
+                # note: here assume no pnr
+                if self.config['use_ULP_f_transit'] and f_transit_ULP is not None:
+                    f_passenger_bustransit = f_transit_ULP
+                    self.nb.update_demand_path_bustransit(f_passenger_bustransit)
+                    q_e_mode_bustransit = np.empty((0, self.num_assign_interval)) 
+                    for O_node in self.nb.path_table_bustransit.path_dict.keys():
+                        O = self.nb.od.O_dict.inv[O_node]
+                        for D_node in self.nb.path_table_bustransit.path_dict[O_node].keys():
+                            D = self.nb.od.D_dict.inv[D_node]
+                            demand = self.nb.demand_bustransit.demand_dict[O][D]
+                            q_e_mode_bustransit = np.vstack((q_e_mode_bustransit, demand))
+                    q_e_mode_bustransit = q_e_mode_bustransit.flatten(order='F')
+                    
                 # relu
                 # q_e_passenger = np.maximum(q_e_passenger, 1e-6)
                 q_e_truck = np.maximum(q_e_truck, 1e-6)
@@ -3795,8 +4177,9 @@ class MMDODE:
                 
                 best_q_e_mode_driving, best_q_e_mode_bustransit, best_q_e_mode_pnr = q_e_mode_driving, q_e_mode_bustransit, q_e_mode_pnr
 
-                best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus = \
-                    x_e_car, x_e_truck, x_e_passenger, x_e_bus, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus
+                best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_x_e_BoardingAlighting_count, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus,\
+                     best_stop_arrival_departure_travel_time_df = \
+                    x_e_car, x_e_truck, x_e_passenger, x_e_bus, x_e_BoardingAlighting_count, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus, stop_arrival_departure_travel_time_df
 
                 if save_folder is not None:
                     self.save_simulation_input_files(folder_path = os.path.join(save_folder, 'input_files_estimate_demand'), explicit_bus=explicit_bus, historical_bus_waiting_time=0)
@@ -3806,7 +4189,7 @@ class MMDODE:
                              q_e_truck, 
                              q_e_mode_driving, q_e_mode_bustransit, q_e_mode_pnr,
                              f_car_driving, f_truck_driving, f_passenger_bustransit, f_car_pnr, f_bus,
-                             x_e_car, x_e_truck, x_e_passenger, x_e_bus, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus], 
+                             x_e_car, x_e_truck, x_e_passenger, x_e_bus, x_e_BoardingAlighting_count, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus, stop_arrival_departure_travel_time_df], 
                             open(os.path.join(save_folder, str(starting_epoch + i) + '_iteration_estimate_demand.pickle'), 'wb'))
 
                 # if column_generation[i]:
@@ -3816,8 +4199,1850 @@ class MMDODE:
         
         print("Best loss at Epoch:", best_epoch, "Loss:", loss_list[best_epoch][0], self.print_separate_accuracy(loss_list[best_epoch][1]))
         return best_f_car_driving, best_f_truck_driving, best_f_passenger_bustransit, best_f_car_pnr, best_f_bus, best_q_e_truck, \
-                best_q_e_mode_driving, best_q_e_mode_bustransit, best_q_e_mode_pnr, best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus, \
+                best_q_e_mode_driving, best_q_e_mode_bustransit, best_q_e_mode_pnr, best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_x_e_BoardingAlighting_count, \
+                best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus, best_stop_arrival_departure_travel_time_df, \
                 loss_list
+    
+    def run_pure_simulation(self, f_car_driving, f_truck_driving, f_passenger_bustransit, f_pnr, counter =0, explicit_bus=1, historical_bus_waiting_time=0):
+
+        hash1 = hashlib.sha1()
+        hash1.update((str(time.time()) + str(counter)).encode('utf-8'))
+        new_folder = str(hash1.hexdigest())
+
+        self.save_simulation_input_files(folder_path = new_folder, f_car_driving=f_car_driving, f_truck_driving=f_truck_driving, 
+                                            f_passenger_bustransit=f_passenger_bustransit, f_car_pnr=f_pnr, f_bus=None,
+                                         explicit_bus=explicit_bus, historical_bus_waiting_time=historical_bus_waiting_time)
+
+        a = macposts.mmdta_api()
+        a.initialize(new_folder)
+
+        link_driving_array = np.array([e.ID for e in self.nb.link_driving_list], dtype=int)
+        a.register_links_driving(link_driving_array)
+        link_bus_array = np.array([e.ID for e in self.nb.link_bus_list], dtype=int)
+        a.register_links_bus(link_bus_array)
+        link_walking_array = np.array([e.ID for e in self.nb.link_walking_list], dtype=int)
+        a.register_links_walking(link_walking_array)
+
+        a.register_paths(self.paths_list)
+        a.register_paths_driving(self.paths_list_driving)
+        a.register_paths_bustransit(self.paths_list_bustransit)
+        a.register_paths_pnr(self.paths_list_pnr)
+        a.register_paths_bus(self.paths_list_busroute)
+
+        a.install_cc()
+        a.install_cc_tree()
+        a.run_whole(False)
+
+        start_intervals = np.arange(self.num_loading_interval)
+
+        car_link_tt = a.get_car_link_tt(start_intervals, False)
+        assert(car_link_tt.shape[0] == len(link_driving_array))
+
+        bus_link_tt = a.get_bus_link_tt(start_intervals, False, False)
+        assert(bus_link_tt.shape[0] == len(link_bus_array))
+
+        walking_link_tt = a.get_passenger_walking_link_tt(start_intervals)
+        assert(walking_link_tt.shape[0] == len(link_walking_array))
+
+        # change to be np.float32 to save memory
+        car_link_tt = car_link_tt.astype(np.float32)
+        bus_link_tt = bus_link_tt.astype(np.float32)
+        walking_link_tt = walking_link_tt.astype(np.float32)
+
+        shutil.rmtree(new_folder)
+        a.delete_all_agents()
+
+        return car_link_tt, bus_link_tt, walking_link_tt
+
+
+    def compute_path_travel_waiting_walking_time(self, input_file_folder, f_car_driving, f_truck_driving, f_passenger_bustransit, f_pnr, use_robust = True):
+        
+        car_link_tt, bus_link_tt, walking_link_tt = self.run_pure_simulation(f_car_driving, f_truck_driving, f_passenger_bustransit, f_pnr)
+        
+        num_loading_interval = self.num_loading_interval
+        unit_time = self.nb.config.config_dict['DTA']['unit_time']
+        assign_frq = self.nb.config.config_dict['DTA']['assign_frq']
+        num_assign_interval = self.num_assign_interval
+
+        # replace huge values with the values of the previous interval - based on the setting of macposts
+        car_link_tt = pd.DataFrame(car_link_tt)
+        car_link_tt.replace(2*num_loading_interval*unit_time, np.nan, inplace=True)
+        car_link_tt.ffill(axis=1, inplace=True)
+        car_link_tt = car_link_tt.to_numpy()
+
+        bus_link_tt = pd.DataFrame(bus_link_tt)
+        bus_link_tt.replace(2*num_loading_interval*unit_time, np.nan, inplace=True)
+        bus_link_tt.ffill(axis=1, inplace=True)
+        bus_link_tt = bus_link_tt.to_numpy()
+        bus_link_tt = np.nan_to_num(bus_link_tt, nan=num_loading_interval*unit_time) 
+
+        # load dode_data.pickle
+        with open(os.path.join(input_file_folder, 'dode_data.pickle'), 'rb') as f:
+            [OD_pathset_list_driving, OD_pathset_list_transit, OD_pathset_list_pnr, car_link_tt_dict, bus_link_tt_dict, walking_link_tt_dict, transit_link_dict, \
+            _, _, _] = pickle.load(f)
+
+        for i in range(len(car_link_tt)):
+            link_id = list(car_link_tt_dict.keys())[i]
+            car_link_tt_dict[link_id] = car_link_tt[i]
+        for i in range(len(bus_link_tt)):
+            link_id = list(bus_link_tt_dict.keys())[i]
+            bus_link_tt_dict[link_id] = bus_link_tt[i]
+        for i in range(len(walking_link_tt)):
+            link_id = list(walking_link_tt_dict.keys())[i]
+            walking_link_tt_dict[link_id] = walking_link_tt[i]
+
+        # compute path travel time, walking time and waiting time: by 5-s (loading intervel) first and then convert to assign-interval-based given use_robust
+        OD_path_tt_list_driving = copy.deepcopy(OD_pathset_list_driving)
+        OD_path_alltts_list_transit = copy.deepcopy(OD_pathset_list_transit)
+        OD_path_alltts_list_pnr = copy.deepcopy(OD_pathset_list_pnr)
+
+        for O in OD_pathset_list_driving.keys():
+            for D in OD_pathset_list_driving[O].keys():
+                # driving
+                OD_path_tt_list_driving[O][D] = []
+                for path in OD_pathset_list_driving[O][D]:
+                    path_tt = []
+                    for loading_interval in range(num_loading_interval):
+                        arrival_time = loading_interval
+                        finish = False
+                        for link in path:
+                            if arrival_time < num_loading_interval:
+                                arrival_time += int(car_link_tt_dict[link][arrival_time] / unit_time)
+                            else:
+                                path_tt.append(np.inf)
+                                finish = True
+                                break
+                        if not finish:
+                            path_tt.append((arrival_time - loading_interval) * unit_time)
+                    path_tt = np.array(path_tt)
+                    if np.isinf(path_tt[0]):  # if the first interval is inf, then all the tts for all the loading intervals are large numbers
+                        path_bus_tt =np.ones(num_loading_interval) * unit_time * num_loading_interval
+                    elif np.isinf(path_tt).any():
+                        for i in range(len(path_tt)):
+                            if np.isinf(path_tt[i]):
+                                path_tt[i] = path_tt[i-1]
+                    # if np.isinf(path_tt[-1]):
+                    #     last_valid = path_tt[np.isfinite(path_tt)][-1]
+                    #     for i in range(len(path_tt)-1, -1, -1):
+                    #         if np.isinf(path_tt[i]):
+                    #             path_tt[i] = last_valid
+                    #         else:
+                    #             break
+                    if use_robust:  # suggest use robust when init_demand_split = 1 in the config
+                        # based on the rationale in macposts, the release interval if init_demand_split = 1 is 1 min (12 5-s intervals)
+                        path_tt = path_tt[::12] #  pick the first 5-s interval of each minute, because in that 1 min, the demand is released at the first 5-s interval
+                        num_mins_in_assign_interval = int(assign_frq * unit_time/60)
+                        # compute the average travel time in each assign interval (among the 15 minutes)
+                        path_tt = path_tt.reshape(int(len(path_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                        assert(len(path_tt) == num_assign_interval)
+                    else:
+                        # just pick the value of the first 5-s interval of each assignment interval
+                        path_tt = path_tt[::int(assign_frq)]
+                        assert(len(path_tt) == num_assign_interval)
+
+                    OD_path_tt_list_driving[O][D].append(path_tt)
+
+                # transit
+                if O in OD_pathset_list_transit:
+                    if D in OD_pathset_list_transit[O]:
+                        OD_path_alltts_list_transit[O][D] = []
+                        for path in OD_pathset_list_transit[O][D]:  
+                            path_tt, path_bus_tt, path_metro_tt, path_bus_waiting_tt, path_metro_waiting_tt, path_walking_tt = [], [], [], [], [], []
+                            for loading_interval in range(num_loading_interval):
+                                arrival_time = loading_interval
+                                bus_tt, metro_tt, bus_waiting_tt, metro_waiting_tt, walking_tt = 0, 0, 0, 0, 0
+                                finish = False
+                                for link in path:
+                                    if arrival_time < num_loading_interval:
+                                        if transit_link_dict[link] == 'bus':
+                                            bus_tt += bus_link_tt_dict[link][arrival_time]
+                                            arrival_time += int(bus_link_tt_dict[link][arrival_time] / unit_time)
+                                        elif transit_link_dict[link] == 'metro':
+                                            metro_tt += bus_link_tt_dict[link][arrival_time]
+                                            arrival_time += int(bus_link_tt_dict[link][arrival_time] / unit_time)
+                                        elif transit_link_dict[link] == 'bus_boarding':
+                                            bus_waiting_tt += int(walking_link_tt_dict[link][arrival_time] / unit_time) * unit_time
+                                            arrival_time += int(walking_link_tt_dict[link][arrival_time] / unit_time)
+                                        elif transit_link_dict[link] == 'metro_boarding':
+                                            metro_waiting_tt += int(walking_link_tt_dict[link][arrival_time] / unit_time) * unit_time
+                                            arrival_time += int(walking_link_tt_dict[link][arrival_time] / unit_time)
+                                        elif transit_link_dict[link] == 'walking':
+                                            walking_tt += max(int(walking_link_tt_dict[link][arrival_time]/unit_time) , 1) * unit_time
+                                            arrival_time += max(int(walking_link_tt_dict[link][arrival_time] / unit_time) , 1)
+                                    else:
+                                        path_tt.append(np.inf)
+                                        path_bus_tt.append(np.inf)
+                                        path_metro_tt.append(np.inf)
+                                        path_bus_waiting_tt.append(np.inf)
+                                        path_metro_waiting_tt.append(np.inf)
+                                        path_walking_tt.append(np.inf)
+                                        finish = True
+                                        break
+                                if not finish:
+                                    path_tt.append((arrival_time - loading_interval) * unit_time)
+                                    path_bus_tt.append(bus_tt)
+                                    path_metro_tt.append(metro_tt)
+                                    path_bus_waiting_tt.append(bus_waiting_tt)
+                                    path_metro_waiting_tt.append(metro_waiting_tt)
+                                    path_walking_tt.append(walking_tt)
+                            path_tt = np.array(path_tt)
+                            path_bus_tt = np.array(path_bus_tt)
+                            path_metro_tt = np.array(path_metro_tt)
+                            path_bus_waiting_tt = np.array(path_bus_waiting_tt)
+                            path_metro_waiting_tt = np.array(path_metro_waiting_tt)
+                            path_walking_tt = np.array(path_walking_tt)
+                            if np.isinf(path_tt[0]):  # if the first interval is inf, then all the tts for all the loading intervals are large numbers
+                                path_bus_tt =np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_metro_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_bus_waiting_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_metro_waiting_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_walking_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                            # if np.isinf(path_tt[-1]):
+                            #     last_valid = path_tt[np.isfinite(path_tt)][-1]
+                            #     last_valid_bus_tt = path_bus_tt[np.isfinite(path_bus_tt)][-1]
+                            #     last_valid_metro_tt = path_metro_tt[np.isfinite(path_metro_tt)][-1]
+                            #     last_valid_bus_waiting_tt = path_bus_waiting_tt[np.isfinite(path_bus_waiting_tt)][-1]
+                            #     last_valid_metro_waiting_tt = path_metro_waiting_tt[np.isfinite(path_metro_waiting_tt)][-1]
+                            #     last_valid_walking_tt = path_walking_tt[np.isfinite(path_walking_tt)][-1]
+                            #     for i in range(len(path_tt)-1, -1, -1):
+                            #         if np.isinf(path_tt[i]):
+                            #             path_tt[i] = last_valid
+                            #             path_bus_tt[i] = last_valid_bus_tt
+                            #             path_metro_tt[i] = last_valid_metro_tt
+                            #             path_bus_waiting_tt[i] = last_valid_bus_waiting_tt
+                            #             path_metro_waiting_tt[i] = last_valid_metro_waiting_tt
+                            #             path_walking_tt[i] = last_valid_walking_tt
+                            #         else:
+                            #             break
+
+                            elif np.isinf(path_tt).any():
+                                for i in range(len(path_tt)):
+                                    if np.isinf(path_tt[i]):
+                                        path_tt[i] = path_tt[i-1]
+                                        path_bus_tt[i] = path_bus_tt[i-1]
+                                        path_metro_tt[i] = path_metro_tt[i-1]
+                                        path_bus_waiting_tt[i] = path_bus_waiting_tt[i-1]
+                                        path_metro_waiting_tt[i] = path_metro_waiting_tt[i-1]
+                                        path_walking_tt[i] = path_walking_tt[i-1]
+                            
+                            if use_robust:
+                                path_tt = path_tt[::12]
+                                path_bus_tt = path_bus_tt[::12]
+                                path_metro_tt = path_metro_tt[::12]
+                                path_bus_waiting_tt = path_bus_waiting_tt[::12]
+                                path_metro_waiting_tt = path_metro_waiting_tt[::12]
+                                path_walking_tt = path_walking_tt[::12]
+                                num_mins_in_assign_interval = int(assign_frq * unit_time/60)
+                                path_tt = path_tt.reshape(int(len(path_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_bus_tt = path_bus_tt.reshape(int(len(path_bus_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_metro_tt = path_metro_tt.reshape(int(len(path_metro_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_bus_waiting_tt = path_bus_waiting_tt.reshape(int(len(path_bus_waiting_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_metro_waiting_tt = path_metro_waiting_tt.reshape(int(len(path_metro_waiting_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_walking_tt = path_walking_tt.reshape(int(len(path_walking_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                assert(len(path_tt) == num_assign_interval)
+                                assert(len(path_bus_tt) == num_assign_interval)
+                                assert(len(path_metro_tt) == num_assign_interval)
+                                assert(len(path_bus_waiting_tt) == num_assign_interval)
+                                assert(len(path_metro_waiting_tt) == num_assign_interval)
+                                assert(len(path_walking_tt) == num_assign_interval)
+                            else:
+                                path_tt = path_tt[::int(assign_frq)]
+                                path_bus_tt = path_bus_tt[::int(assign_frq)]
+                                path_metro_tt = path_metro_tt[::int(assign_frq)]
+                                path_bus_waiting_tt = path_bus_waiting_tt[::int(assign_frq)]
+                                path_metro_waiting_tt = path_metro_waiting_tt[::int(assign_frq)]
+                                path_walking_tt = path_walking_tt[::int(assign_frq)]
+                                assert(len(path_tt) == num_assign_interval)
+                                assert(len(path_bus_tt) == num_assign_interval)
+                                assert(len(path_metro_tt) == num_assign_interval)
+                                assert(len(path_bus_waiting_tt) == num_assign_interval)
+                                assert(len(path_metro_waiting_tt) == num_assign_interval)
+                                assert(len(path_walking_tt) == num_assign_interval)
+                            tt_dict = {'path_tt': path_tt, 'bus': path_bus_tt, 'metro': path_metro_tt, \
+                                    'bus_waiting': path_bus_waiting_tt, 'metro_waiting': path_metro_waiting_tt, 'walking': path_walking_tt}
+                            for key, arr in tt_dict.items():
+                                assert not np.isnan(arr).any(), f"NaN detected in array at key: {key}"
+                            OD_path_alltts_list_transit[O][D].append(tt_dict)
+                
+                # pnr
+                if O in OD_pathset_list_pnr:
+                    if D in OD_pathset_list_pnr[O]:
+                        OD_path_alltts_list_pnr[O][D] = []
+                        for path in OD_pathset_list_pnr[O][D]:  
+                            path_tt, path_car_tt, path_bus_tt, path_metro_tt, path_bus_waiting_tt, path_metro_waiting_tt, path_walking_tt = [], [], [], [], [], [], []
+                            for loading_interval in range(num_loading_interval):
+                                arrival_time = loading_interval
+                                car_tt, bus_tt, metro_tt, bus_waiting_tt, metro_waiting_tt, walking_tt = 0, 0, 0, 0, 0, 0
+                                finish = False
+                                for link in path:
+                                    if arrival_time < num_loading_interval:
+                                        if link not in transit_link_dict:
+                                            car_tt += int(car_link_tt_dict[link][arrival_time] / unit_time) * unit_time
+                                            arrival_time += int(car_link_tt_dict[link][arrival_time] / unit_time)
+                                        else:
+                                            if transit_link_dict[link] == 'bus':
+                                                bus_tt += bus_link_tt_dict[link][arrival_time]
+                                                arrival_time += int(bus_link_tt_dict[link][arrival_time] / unit_time)
+                                            elif transit_link_dict[link] == 'metro':
+                                                metro_tt += bus_link_tt_dict[link][arrival_time]
+                                                arrival_time += int(bus_link_tt_dict[link][arrival_time] / unit_time)
+                                            elif transit_link_dict[link] == 'bus_boarding':
+                                                bus_waiting_tt += int(walking_link_tt_dict[link][arrival_time] / unit_time) * unit_time
+                                                arrival_time += int(walking_link_tt_dict[link][arrival_time] / unit_time)
+                                            elif transit_link_dict[link] == 'metro_boarding':
+                                                metro_waiting_tt += int(walking_link_tt_dict[link][arrival_time] / unit_time) * unit_time
+                                                arrival_time += int(walking_link_tt_dict[link][arrival_time] / unit_time)
+                                            elif transit_link_dict[link] == 'walking':
+                                                walking_tt += max(int(walking_link_tt_dict[link][arrival_time] / unit_time) , 1) * unit_time
+                                                arrival_time += max(int(walking_link_tt_dict[link][arrival_time] / unit_time) , 1)
+                                            else: # parking type: tt out of parking lot includes cruising time so counted as car tt
+                                                car_tt += max(int(walking_link_tt_dict[link][arrival_time] / unit_time) , 1) * unit_time
+                                                arrival_time += max(int(walking_link_tt_dict[link][arrival_time] / unit_time) , 1)
+                                    else:
+                                        path_tt.append(np.inf)
+                                        path_car_tt.append(np.inf)
+                                        path_bus_tt.append(np.inf)
+                                        path_metro_tt.append(np.inf)
+                                        path_bus_waiting_tt.append(np.inf)
+                                        path_metro_waiting_tt.append(np.inf)
+                                        path_walking_tt.append(np.inf)
+                                        finish = True
+                                        break
+                                if not finish:
+                                    path_tt.append((arrival_time - loading_interval) * unit_time)
+                                    path_car_tt.append(car_tt)
+                                    path_bus_tt.append(bus_tt)
+                                    path_metro_tt.append(metro_tt)
+                                    path_bus_waiting_tt.append(bus_waiting_tt)
+                                    path_metro_waiting_tt.append(metro_waiting_tt)
+                                    path_walking_tt.append(walking_tt)
+                            path_tt = np.array(path_tt)
+                            path_car_tt = np.array(path_car_tt)
+                            path_bus_tt = np.array(path_bus_tt)
+                            path_metro_tt = np.array(path_metro_tt)
+                            path_bus_waiting_tt = np.array(path_bus_waiting_tt)
+                            path_metro_waiting_tt = np.array(path_metro_waiting_tt)
+                            path_walking_tt = np.array(path_walking_tt)
+                            if np.isinf(path_tt[0]):
+                                path_car_tt =np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_bus_tt =np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_metro_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_bus_waiting_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_metro_waiting_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_walking_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                                path_tt = np.ones(num_loading_interval) * unit_time * num_loading_interval
+                            # if np.isinf(path_tt[-1]):
+                            #     last_valid = path_tt[np.isfinite(path_tt)][-1]
+                            #     last_valid_car_tt = path_car_tt[np.isfinite(path_car_tt)][-1]
+                            #     last_valid_bus_tt = path_bus_tt[np.isfinite(path_bus_tt)][-1]
+                            #     last_valid_metro_tt = path_metro_tt[np.isfinite(path_metro_tt)][-1]
+                            #     last_valid_bus_waiting_tt = path_bus_waiting_tt[np.isfinite(path_bus_waiting_tt)][-1]
+                            #     last_valid_metro_waiting_tt = path_metro_waiting_tt[np.isfinite(path_metro_waiting_tt)][-1]
+                            #     last_valid_walking_tt = path_walking_tt[np.isfinite(path_walking_tt)][-1]
+                            #     for i in range(len(path_tt)-1, -1, -1):
+                            #         if np.isinf(path_tt[i]):
+                            #             path_tt[i] = last_valid
+                            #             path_car_tt[i] = last_valid_car_tt
+                            #             path_bus_tt[i] = last_valid_bus_tt
+                            #             path_metro_tt[i] = last_valid_metro_tt
+                            #             path_bus_waiting_tt[i] = last_valid_bus_waiting_tt
+                            #             path_metro_waiting_tt[i] = last_valid_metro_waiting_tt
+                            #             path_walking_tt[i] = last_valid_walking_tt
+                            #         else:
+                            #             break
+
+                            elif np.isinf(path_tt).any():
+                                for i in range(len(path_tt)):
+                                    if np.isinf(path_tt[i]):
+                                        path_tt[i] = path_tt[i-1]
+                                        path_car_tt[i] = path_car_tt[i-1]
+                                        path_bus_tt[i] = path_bus_tt[i-1]
+                                        path_metro_tt[i] = path_metro_tt[i-1]
+                                        path_bus_waiting_tt[i] = path_bus_waiting_tt[i-1]
+                                        path_metro_waiting_tt[i] = path_metro_waiting_tt[i-1]
+                                        path_walking_tt[i] = path_walking_tt[i-1]
+
+                            if use_robust:
+                                path_tt = path_tt[::12]
+                                path_car_tt = path_car_tt[::12]
+                                path_bus_tt = path_bus_tt[::12]
+                                path_metro_tt = path_metro_tt[::12]
+                                path_bus_waiting_tt = path_bus_waiting_tt[::12]
+                                path_metro_waiting_tt = path_metro_waiting_tt[::12]
+                                path_walking_tt = path_walking_tt[::12]
+                                num_mins_in_assign_interval = int(assign_frq * unit_time/60)
+                                path_tt = path_tt.reshape(int(len(path_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_car_tt = path_car_tt.reshape(int(len(path_car_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_bus_tt = path_bus_tt.reshape(int(len(path_bus_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_metro_tt = path_metro_tt.reshape(int(len(path_metro_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_bus_waiting_tt = path_bus_waiting_tt.reshape(int(len(path_bus_waiting_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_metro_waiting_tt = path_metro_waiting_tt.reshape(int(len(path_metro_waiting_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                path_walking_tt = path_walking_tt.reshape(int(len(path_walking_tt)/num_mins_in_assign_interval), num_mins_in_assign_interval).mean(axis=1)
+                                assert(len(path_tt) == num_assign_interval)
+                                assert(len(path_car_tt) == num_assign_interval)
+                                assert(len(path_bus_tt) == num_assign_interval)
+                                assert(len(path_metro_tt) == num_assign_interval)
+                                assert(len(path_bus_waiting_tt) == num_assign_interval)
+                                assert(len(path_metro_waiting_tt) == num_assign_interval)
+                                assert(len(path_walking_tt) == num_assign_interval)
+                            else:
+                                path_tt = path_tt[::int(assign_frq)]
+                                path_car_tt = path_car_tt[::int(assign_frq)]
+                                path_bus_tt = path_bus_tt[::int(assign_frq)]
+                                path_metro_tt = path_metro_tt[::int(assign_frq)]
+                                path_bus_waiting_tt = path_bus_waiting_tt[::int(assign_frq)]
+                                path_metro_waiting_tt = path_metro_waiting_tt[::int(assign_frq)]
+                                path_walking_tt = path_walking_tt[::int(assign_frq)]
+                                assert(len(path_tt) == num_assign_interval)
+                                assert(len(path_car_tt) == num_assign_interval)
+                                assert(len(path_bus_tt) == num_assign_interval)
+                                assert(len(path_metro_tt) == num_assign_interval)
+                                assert(len(path_bus_waiting_tt) == num_assign_interval)
+                                assert(len(path_metro_waiting_tt) == num_assign_interval)
+                                assert(len(path_walking_tt) == num_assign_interval)
+                            tt_dict = {'path_tt': path_tt, 'car': path_car_tt, 'bus': path_bus_tt, 'metro': path_metro_tt, \
+                                    'bus_waiting': path_bus_waiting_tt, 'metro_waiting': path_metro_waiting_tt, 'walking': path_walking_tt}
+                            for key, arr in tt_dict.items():
+                                assert not np.isnan(arr).any(), f"NaN detected in array at key: {key}"
+                            OD_path_alltts_list_pnr[O][D].append(tt_dict)
+        return OD_path_tt_list_driving, OD_path_alltts_list_transit, OD_path_alltts_list_pnr                   
+          
+    def compute_path_cost_all(self, input_file_folder, OD_path_tt_list_driving, OD_path_alltts_list_transit, OD_path_alltts_list_pnr, beta_dict, alpha_dict, gamma_dict):
+        
+        bus_fare = self.nb.config.config_dict['MMDUE']['bus_fare']
+        metro_fare =self.nb.config.config_dict['MMDUE']['metro_fare']
+
+        # read median income and population density of OD pairs
+        with open(os.path.join(input_file_folder, 'disutility_info_df.pickle'), 'rb') as f:
+            disutility_info_df = pickle.load(f)
+        # load dode_data.pickle
+        with open(os.path.join(input_file_folder, 'dode_data.pickle'), 'rb') as f:
+            [_, _, _, _, _, _, _, \
+            _, OD_path_type_list_transit,OD_path_type_list_pnr] = pickle.load(f)
+
+        OD_path_cost_list_driving = copy.deepcopy(OD_path_tt_list_driving)
+        OD_path_cost_list_transit = copy.deepcopy(OD_path_alltts_list_transit)
+        OD_path_cost_list_pnr = copy.deepcopy(OD_path_alltts_list_pnr)
+
+        for O in OD_path_tt_list_driving.keys():
+            for D in OD_path_tt_list_driving[O].keys():
+                # driving
+                OD_path_cost_list_driving[O][D] = []
+                for path_tt in OD_path_tt_list_driving[O][D]:
+                    path_cost = beta_dict['beta_tt_car'] * path_tt/60 + beta_dict['beta_money'] * disutility_info_df[disutility_info_df['D_id'] == D]['parking_fee'].values[0]\
+                                + gamma_dict['gamma_income_car'] * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0] \
+                                + gamma_dict['gamma_Originpopden_car'] * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0] \
+                                + gamma_dict['gamma_Destpopden_car'] * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0]
+                    OD_path_cost_list_driving[O][D].append(path_cost)
+                
+                # transit
+                if O in OD_path_alltts_list_transit:
+                    if D in OD_path_alltts_list_transit[O]:
+                        OD_path_cost_list_transit[O][D] = []
+                        for alltts_dict in OD_path_alltts_list_transit[O][D]:
+                            path_cost = beta_dict['beta_tt_bus'] * alltts_dict['bus'] /60 + beta_dict['beta_tt_metro'] * alltts_dict['metro'] /60 \
+                                        + beta_dict['beta_waiting_bus'] * alltts_dict['bus_waiting'] /60 + beta_dict['beta_waiting_metro'] * alltts_dict['metro_waiting'] /60 \
+                                        + beta_dict['beta_walking'] * alltts_dict['walking']/60
+                            if OD_path_type_list_transit[O][D] == 'bus':
+                                path_cost += beta_dict['beta_money'] * bus_fare + gamma_dict['gamma_income_bus'] * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0] \
+                                    + gamma_dict['gamma_Originpopden_bus'] * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0] \
+                                    + gamma_dict['gamma_Destpopden_bus'] * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0] + alpha_dict['alpha_bus']
+                            elif OD_path_type_list_transit[O][D] == 'metro':
+                                path_cost += beta_dict['beta_money'] * metro_fare + gamma_dict['gamma_income_metro'] * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0] \
+                                    + gamma_dict['gamma_Originpopden_metro'] * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0] \
+                                    + gamma_dict['gamma_Destpopden_metro'] * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0] + alpha_dict['alpha_metro']
+                            else:
+                                path_cost += beta_dict['beta_money'] * (bus_fare + metro_fare) + gamma_dict['gamma_income_busmetro'] * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0] \
+                                    + gamma_dict['gamma_Originpopden_busmetro'] * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0] \
+                                    + gamma_dict['gamma_Destpopden_busmetro'] * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0] + alpha_dict['alpha_busmetro']
+                            OD_path_cost_list_transit[O][D].append(path_cost)
+
+                # pnr
+                if O in OD_path_alltts_list_pnr:
+                    if D in OD_path_alltts_list_pnr[O]:
+                        OD_path_cost_list_pnr[O][D] = []
+                        for alltts_dict in OD_path_alltts_list_pnr[O][D]:
+                            path_cost = beta_dict['beta_tt_car'] * alltts_dict['car'] /60 + beta_dict['beta_tt_bus'] * alltts_dict['bus'] /60 + beta_dict['beta_tt_metro'] * alltts_dict['metro'] /60 \
+                                        + beta_dict['beta_waiting_bus'] * alltts_dict['bus_waiting'] /60 + beta_dict['beta_waiting_metro'] * alltts_dict['metro_waiting'] /60 \
+                                        + beta_dict['beta_walking'] * alltts_dict['walking']/60 + beta_dict['beta_money'] * disutility_info_df['pnr_parking_fee'].values[0]
+                            # assume all the parking lots for pnr have the same parking fee
+                            if OD_path_type_list_pnr[O][D] == 'car+bus':
+                                path_cost += beta_dict['beta_money'] * bus_fare + gamma_dict['gamma_income_carbus'] * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0] \
+                                    + gamma_dict['gamma_Originpopden_carbus'] * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0] \
+                                    + gamma_dict['gamma_Destpopden_carbus'] * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0] + alpha_dict['alpha_carbus']
+                            elif OD_path_type_list_pnr[O][D] == 'car+metro':
+                                path_cost += beta_dict['beta_money'] * metro_fare + gamma_dict['gamma_income_carmetro'] * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0] \
+                                    + gamma_dict['gamma_Originpopden_carmetro'] * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0] \
+                                    + gamma_dict['gamma_Destpopden_carmetro'] * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0] + alpha_dict['alpha_carmetro']
+                            else:
+                                path_cost += beta_dict['beta_money'] * (bus_fare + metro_fare) + gamma_dict['gamma_income_carbusmetro'] * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0] \
+                                    + gamma_dict['gamma_Originpopden_carbusmetro'] * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0] \
+                                    + gamma_dict['gamma_Destpopden_carbusmetro'] * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0] + alpha_dict['alpha_carbusmetro']
+                            OD_path_cost_list_pnr[O][D].append(path_cost)
+
+        return OD_path_cost_list_driving, OD_path_cost_list_transit, OD_path_cost_list_pnr
+                        
+                        
+    def mode_route_choice_from_cost(self, input_file_folder, OD_path_cost_list_driving, OD_path_cost_list_transit, OD_path_cost_list_pnr, q_e_traveler, nested_type, theta_dict):
+        
+        '''theta_dict: for the 1st level: \
+            theta_dict['theta_1_driving'], theta_dict['theta_1_transit'], theta_dict['theta_1_pnr'], theta_dict['theta_1_bus'], theta_dict['theta_1_metro'], \
+            theta_dict['theta_1_combinedtransit'], theta_dict['theta_1_transit']\
+            for the 2nd level: \
+            theta_dict['theta_car'], theta_dict['theta_bus'], theta_dict['theta_metro'], theta_dict['theta_busmetro'], 
+             theta_dict['theta_carbus'], theta_dict['theta_carmetro'], and theta_dict['theta_carbusmetro']'''
+        
+        q_e_traveler = q_e_traveler.reshape((int(len(q_e_traveler) / self.num_assign_interval), self.num_assign_interval), order='F')
+        
+        
+        with open(os.path.join(input_file_folder, 'dode_data.pickle'), 'rb') as f:
+            [_, _, _, _, _, _, _, \
+            od_mode_connectivity, OD_path_type_list_transit,OD_path_type_list_pnr] = pickle.load(f)
+
+        f_car_driving = []
+        f_transit =[]
+        f_pnr =[]
+
+        k_probs_driving, k_probs_transit, k_probs_pnr = [], [], []
+        gm_probs_driving, gm_probs_transit, gm_probs_pnr = [], [], []
+        m_probs_driving, m_probs_transit, m_probs_pnr = [], [], []
+
+        OD_index = -1
+        for O in OD_path_cost_list_driving.keys():
+            for D in OD_path_cost_list_driving[O].keys():
+                OD_index += 1
+                # driving is avaliable for all the OD pairs (assumed)
+                pathcost_array_car = np.array(OD_path_cost_list_driving[O][D])
+                exp_pathcost_array_car = np.maximum(np.exp((- 1/ theta_dict['theta_car']) * pathcost_array_car),1e-6)
+                col_sum = np.sum(exp_pathcost_array_car, axis =0)
+                path_prob_car = exp_pathcost_array_car / col_sum
+                IV_car = np.log(col_sum)
+                assert not np.isnan(path_prob_car).any()
+                assert not np.isnan(IV_car).any()
+
+                row = od_mode_connectivity[(od_mode_connectivity['OriginNodeID'] == O) & (od_mode_connectivity['DestNodeID'] == D)]
+                if row['bus'].values[0] == 1:
+                    path_indices_bus = [i for i, s in enumerate(OD_path_type_list_transit[O][D]) if s == 'bus']
+                    pathcost_array_bus = np.array([OD_path_cost_list_transit[O][D][i] for i in path_indices_bus])
+                    exp_pathcost_array_bus = np.maximum(np.exp((- 1/ theta_dict['theta_bus']) * pathcost_array_bus), 1e-6)
+                    col_sum = np.sum(exp_pathcost_array_bus, axis =0)
+                    path_prob_bus = exp_pathcost_array_bus / col_sum
+                    IV_bus = np.log(col_sum)
+                    has_IV_bus = 1
+                    assert not np.isnan(pathcost_array_bus).any()
+                    assert not np.isnan(exp_pathcost_array_bus).any()
+                    assert not np.isnan(col_sum).any()
+                    assert not np.isnan(path_prob_bus).any()
+                    assert not np.isnan(IV_bus).any()
+                else:
+                    path_indices_bus = []
+                    IV_bus = np.zeros(self.num_assign_interval)
+                    has_IV_bus = 0
+                if row['metro'].values[0] == 1:
+                    path_indices_metro = [i for i, s in enumerate(OD_path_type_list_transit[O][D]) if s == 'metro']
+                    pathcost_array_metro = np.array([OD_path_cost_list_transit[O][D][i] for i in path_indices_metro])
+                    exp_pathcost_array_metro = np.maximum(np.exp((- 1/ theta_dict['theta_metro']) * pathcost_array_metro), 1e-6)
+                    col_sum = np.sum(exp_pathcost_array_metro, axis =0)
+                    path_prob_metro = exp_pathcost_array_metro / col_sum
+                    IV_metro = np.log(col_sum)
+                    has_IV_metro = 1
+                    assert not np.isnan(path_prob_metro).any()
+                    assert not np.isnan(IV_metro).any()
+                else:
+                    path_indices_metro = []
+                    IV_metro = np.zeros(self.num_assign_interval)
+                    has_IV_metro = 0
+                if row['bus+metro'].values[0] == 1:
+                    path_indices_busmetro = [i for i, s in enumerate(OD_path_type_list_transit[O][D]) if s == 'bus+metro']
+                    pathcost_array_busmetro = np.array([OD_path_cost_list_transit[O][D][i] for i in path_indices_busmetro])
+                    exp_pathcost_array_busmetro = np.maximum(np.exp((- 1/ theta_dict['theta_busmetro']) * pathcost_array_busmetro), 1e-6)
+                    col_sum = np.sum(exp_pathcost_array_busmetro, axis =0)
+                    path_prob_busmetro = exp_pathcost_array_busmetro / col_sum
+                    IV_busmetro = np.log(col_sum)
+                    has_IV_busmetro = 1
+                    assert not np.isnan(path_prob_busmetro).any()
+                    assert not np.isnan(IV_busmetro).any()
+                else:
+                    path_indices_busmetro = []
+                    IV_busmetro = np.zeros(self.num_assign_interval)
+                    has_IV_busmetro = 0
+
+                if row['car+bus'].values[0] == 1:
+                    path_indices_carbus = [i for i, s in enumerate(OD_path_type_list_pnr[O][D]) if s == 'car+bus']
+                    pathcost_array_carbus = np.array([OD_path_cost_list_pnr[O][D][i] for i in path_indices_carbus])
+                    exp_pathcost_array_carbus = np.maximum(np.exp((- 1/ theta_dict['theta_carbus']) * pathcost_array_carbus), 1e-6)
+                    col_sum = np.sum(exp_pathcost_array_carbus, axis =0)
+                    path_prob_carbus = exp_pathcost_array_carbus / col_sum
+                    IV_carbus = np.log(col_sum)
+                    has_IV_carbus = 1
+                    assert not np.isnan(path_prob_carbus).any()
+                    assert not np.isnan(IV_carbus).any()
+                else:
+                    path_indices_carbus = []
+                    IV_carbus = np.zeros(self.num_assign_interval)
+                    has_IV_carbus = 0
+                if row['car+metro'].values[0] == 1:
+                    path_indices_carmetro = [i for i, s in enumerate(OD_path_type_list_pnr[O][D]) if s == 'car+metro']
+                    pathcost_array_carmetro = np.array([OD_path_cost_list_pnr[O][D][i] for i in path_indices_carmetro])
+                    exp_pathcost_array_carmetro = np.maximum(np.exp((- 1/ theta_dict['theta_carmetro']) * pathcost_array_carmetro), 1e-6)
+                    col_sum = np.sum(exp_pathcost_array_carmetro, axis =0)
+                    path_prob_carmetro = exp_pathcost_array_carmetro / col_sum
+                    IV_carmetro = np.log(col_sum)
+                    has_IV_carmetro = 1
+                    assert not np.isnan(path_prob_carmetro).any()
+                    assert not np.isnan(IV_carmetro).any()
+                else:
+                    path_indices_carmetro = []
+                    IV_carmetro = np.zeros(self.num_assign_interval)
+                    has_IV_carmetro = 0
+                if row['car+bus+metro'].values[0] == 1:
+                    path_indices_carbusmetro = [i for i, s in enumerate(OD_path_type_list_pnr[O][D]) if s == 'car+bus+metro']
+                    pathcost_array_carbusmetro = np.array([OD_path_cost_list_pnr[O][D][i] for i in path_indices_carbusmetro])
+                    exp_pathcost_array_carbusmetro = np.maximum(np.exp((- 1/ theta_dict['theta_carbusmetro']) * pathcost_array_carbusmetro), 1e-6)
+                    col_sum = np.sum(exp_pathcost_array_carbusmetro, axis =0)
+                    path_prob_carbusmetro = exp_pathcost_array_carbusmetro / col_sum
+                    IV_carbusmetro = np.log(col_sum)
+                    has_IV_carbusmetro = 1
+                    assert not np.isnan(path_prob_carbusmetro).any()
+                    assert not np.isnan(IV_carbusmetro).any()
+                else:
+                    path_indices_carbusmetro = []
+                    IV_carbusmetro = np.zeros(self.num_assign_interval)
+                    has_IV_carbusmetro = 0
+
+                if nested_type == 1:
+                    IV_1_driving = np.log(np.exp((theta_dict['theta_car'] / theta_dict['theta_1_driving']) * IV_car))
+                    if row['BusTransit'].values[0] == 1: #note here is the general transit not only bus
+                        has_transit = 1
+                        IV_1_transit = np.log(has_IV_bus * np.exp((theta_dict['theta_bus']/theta_dict['theta_1_transit'])*IV_bus) + has_IV_metro * np.exp((theta_dict['theta_metro']/theta_dict['theta_1_transit'])*IV_metro) + \
+                            has_IV_busmetro * np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_transit'])*IV_busmetro))
+                        assert not np.isnan(IV_1_transit).any()
+                    else:
+                        has_transit = 0 
+                        IV_1_transit = np.zeros(self.num_assign_interval)
+                    if row['PNR'].values[0] == 1:
+                        has_pnr = 1
+                        IV_1_pnr = np.log(has_IV_carbus * np.exp((theta_dict['theta_carbus']/theta_dict['theta_1_pnr'])*IV_carbus) + \
+                                          has_IV_carmetro * np.exp((theta_dict['theta_carmetro']/theta_dict['theta_1_pnr'])*IV_carmetro) + \
+                            has_IV_carbusmetro * np.exp((theta_dict['theta_carbusmetro']/theta_dict['theta_1_pnr'])*IV_carbusmetro))
+                        assert not np.isnan(IV_1_pnr).any()
+                    else:
+                        has_pnr = 0
+                        IV_1_pnr = np.zeros(self.num_assign_interval)
+                    
+                    prob_1_driving = np.exp(theta_dict['theta_1_driving'] * IV_1_driving) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                             has_transit * np.exp(theta_dict['theta_1_transit'] * IV_1_transit) + \
+                                                                                                has_pnr * np.exp(theta_dict['theta_1_pnr'] * IV_1_pnr))
+                    assert not np.isnan(prob_1_driving).any()
+                    prob_car = np.ones(self.num_assign_interval)
+                    final_path_prob_car = prob_1_driving * prob_car * path_prob_car # note the dimensions: path_prob_car is a 2D array
+                    path_flow = q_e_traveler[OD_index] * final_path_prob_car
+                    f_car_driving = f_car_driving + list(path_flow)
+                    k_probs_driving = k_probs_driving + list(path_prob_car)
+                    gm_probs_driving = gm_probs_driving + [prob_car]*len(path_prob_car)
+                    m_probs_driving = m_probs_driving + [prob_1_driving]*len(path_prob_car)
+
+                    if row['BusTransit'].values[0] == 1:
+                        path_flow = list(np.zeros((len(OD_path_type_list_transit[O][D]),self.num_assign_interval)))
+                        k_prob_list, gm_prob_list, m_prob_list = list(np.zeros(len(OD_path_type_list_transit[O][D]))), \
+                            list(np.zeros(len(OD_path_type_list_transit[O][D]))), list(np.zeros(len(OD_path_type_list_transit[O][D])))
+                        prob_1_transit = np.exp(theta_dict['theta_1_transit'] * IV_1_transit) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                                has_transit * np.exp(theta_dict['theta_1_transit'] * IV_1_transit) + \
+                                                                                                    has_pnr * np.exp(theta_dict['theta_1_pnr'] * IV_1_pnr))
+                        assert not np.isnan(prob_1_transit).any()
+                        second_level_denom = has_IV_bus * np.exp((theta_dict['theta_bus']/theta_dict['theta_1_transit'])*IV_bus) + \
+                            has_IV_metro * np.exp((theta_dict['theta_metro']/theta_dict['theta_1_transit'])*IV_metro) + \
+                            has_IV_busmetro * np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_transit'])*IV_busmetro)
+                        if has_IV_bus:
+                            prob_bus = np.exp((theta_dict['theta_bus']/theta_dict['theta_1_transit'])*IV_bus) / second_level_denom  
+                            assert not np.isnan(prob_bus).any()
+                            final_path_prob_bus = prob_1_transit * prob_bus * path_prob_bus
+                            path_flow_bus = q_e_traveler[OD_index] * final_path_prob_bus
+                            for i in range(len(path_indices_bus)):
+                                path_flow[path_indices_bus[i]] = path_flow_bus[i]
+                                k_prob_list[path_indices_bus[i]] = path_prob_bus[i]
+                                gm_prob_list[path_indices_bus[i]] = prob_bus
+                                m_prob_list[path_indices_bus[i]] = prob_1_transit
+                        if has_IV_metro:
+                            prob_metro = np.exp((theta_dict['theta_metro']/theta_dict['theta_1_transit'])*IV_metro) / second_level_denom
+                            final_path_prob_metro = prob_1_transit * prob_metro * path_prob_metro
+                            path_flow_metro = q_e_traveler[OD_index] * final_path_prob_metro
+                            assert not np.isnan(prob_metro).any()
+                            for i in range(len(path_indices_metro)):
+                                path_flow[path_indices_metro[i]] = path_flow_metro[i]
+                                k_prob_list[path_indices_metro[i]] = path_prob_metro[i]
+                                gm_prob_list[path_indices_metro[i]] = prob_metro
+                                m_prob_list[path_indices_metro[i]] = prob_1_transit
+                        if has_IV_busmetro:
+                            prob_busmetro = np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_transit'])*IV_busmetro) / second_level_denom
+                            final_path_prob_busmetro = prob_1_transit * prob_busmetro * path_prob_busmetro
+                            path_flow_busmetro = q_e_traveler[OD_index] * final_path_prob_busmetro
+                            assert not np.isnan(prob_busmetro).any()
+                            for i in range(len(path_indices_busmetro)):
+                                path_flow[path_indices_busmetro[i]] = path_flow_busmetro[i]
+                                k_prob_list[path_indices_busmetro[i]] = path_prob_busmetro[i]
+                                gm_prob_list[path_indices_busmetro[i]] = prob_busmetro
+                                m_prob_list[path_indices_busmetro[i]] = prob_1_transit
+                        f_transit = f_transit + path_flow
+                        k_probs_transit = k_probs_transit + k_prob_list
+                        gm_probs_transit = gm_probs_transit + gm_prob_list
+                        m_probs_transit = m_probs_transit + m_prob_list
+
+                    
+                    if row['PNR'].values[0] == 1:
+                        path_flow = list(np.zeros((len(OD_path_type_list_pnr[O][D]),self.num_assign_interval)))
+                        k_prob_list, gm_prob_list, m_prob_list = list(np.zeros(len(OD_path_type_list_pnr[O][D]))), \
+                            list(np.zeros(len(OD_path_type_list_pnr[O][D]))), list(np.zeros(len(OD_path_type_list_pnr[O][D])))
+                        prob_1_pnr = np.exp(theta_dict['theta_1_pnr'] * IV_1_pnr) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                     has_transit * np.exp(theta_dict['theta_1_transit'] * IV_1_transit) + \
+                                                                                        has_pnr * np.exp(theta_dict['theta_1_pnr'] * IV_1_pnr))
+                        assert not np.isnan(prob_1_pnr).any()
+                        second_level_denom = has_IV_carbus * np.exp((theta_dict['theta_carbus']/theta_dict['theta_1_pnr'])*IV_carbus) + \
+                            has_IV_carmetro * np.exp((theta_dict['theta_carmetro']/theta_dict['theta_1_pnr'])*IV_carmetro) + \
+                            has_IV_carbusmetro * np.exp((theta_dict['theta_carbusmetro']/theta_dict['theta_1_pnr'])*IV_carbusmetro)
+                        if has_IV_carbus:
+                            prob_carbus = np.exp((theta_dict['theta_carbus']/theta_dict['theta_1_pnr'])*IV_carbus) / second_level_denom
+                            final_path_prob_carbus = prob_1_pnr * prob_carbus * path_prob_carbus
+                            path_flow_carbus = q_e_traveler[OD_index] * final_path_prob_carbus
+                            assert not np.isnan(prob_carbus).any()
+                            for i in range(len(path_indices_carbus)):
+                                path_flow[path_indices_carbus[i]] = path_flow_carbus[i]
+                                k_prob_list[path_indices_carbus[i]] = path_prob_carbus[i]
+                                gm_prob_list[path_indices_carbus[i]] = prob_carbus
+                                m_prob_list[path_indices_carbus[i]] = prob_1_pnr
+                        if has_IV_carmetro:
+                            prob_carmetro = np.exp((theta_dict['theta_carmetro']/theta_dict['theta_1_pnr'])*IV_carmetro) / second_level_denom
+                            final_path_prob_carmetro = prob_1_pnr * prob_carmetro * path_prob_carmetro
+                            path_flow_carmetro = q_e_traveler[OD_index] * final_path_prob_carmetro
+                            assert not np.isnan(prob_carmetro).any()
+                            for i in range(len(path_indices_carmetro)):
+                                path_flow[path_indices_carmetro[i]] = path_flow_carmetro[i]
+                                k_prob_list[path_indices_carmetro[i]] = path_prob_carmetro[i]
+                                gm_prob_list[path_indices_carmetro[i]] = prob_carmetro
+                                m_prob_list[path_indices_carmetro[i]] = prob_1_pnr
+                        if has_IV_carbusmetro:
+                            prob_carbusmetro = np.exp((theta_dict['theta_carbusmetro']/theta_dict['theta_1_pnr'])*IV_carbusmetro) / second_level_denom
+                            final_path_prob_carbusmetro = prob_1_pnr * prob_carbusmetro * path_prob_carbusmetro
+                            path_flow_carbusmetro = q_e_traveler[OD_index] * final_path_prob_carbusmetro
+                            assert not np.isnan(prob_carbusmetro).any()
+                            for i in range(len(path_indices_carbusmetro)):
+                                path_flow[path_indices_carbusmetro[i]] = path_flow_carbusmetro[i]
+                                k_prob_list[path_indices_carbusmetro[i]] = path_prob_carbusmetro[i]
+                                gm_prob_list[path_indices_carbusmetro[i]] = prob_carbusmetro
+                                m_prob_list[path_indices_carbusmetro[i]] = prob_1_pnr
+                        f_pnr = f_pnr + path_flow
+                        k_probs_pnr = k_probs_pnr + k_prob_list
+                        gm_probs_pnr = gm_probs_pnr + gm_prob_list
+                        m_probs_pnr = m_probs_pnr + m_prob_list
+                
+                elif nested_type == 2:
+                    IV_1_driving = np.log(np.exp((theta_dict['theta_car'] / theta_dict['theta_1_driving']) * IV_car))
+                    if has_IV_bus or has_IV_carbus:
+                        has_bus_nest = 1
+                        IV_1_bus = np.log(has_IV_bus * np.exp((theta_dict['theta_bus']/theta_dict['theta_1_bus'])*IV_bus) +\
+                                           has_IV_carbus * np.exp((theta_dict['theta_carbus']/theta_dict['theta_1_bus'])*IV_carbus))
+                    else:
+                        has_bus_nest = 0
+                        IV_1_bus = np.zeros(self.num_assign_interval)
+                    if has_IV_metro or has_IV_carmetro:
+                        has_metro_nest = 1
+                        IV_1_metro = np.log(has_IV_metro * np.exp((theta_dict['theta_metro']/theta_dict['theta_1_metro'])*IV_metro) +\
+                                           has_IV_carmetro * np.exp((theta_dict['theta_carmetro']/theta_dict['theta_1_metro'])*IV_carmetro))
+                    else:
+                        has_metro_nest = 0
+                        IV_1_metro = np.zeros(self.num_assign_interval)
+                    if has_IV_busmetro or has_IV_carbusmetro:
+                        has_combinedtransit_nest = 1
+                        IV_1_combinedtransit = np.log(np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_combinedtransit'])*IV_busmetro) + \
+                                                      np.exp((theta_dict['theta_carbusmetro']/theta_dict['theta_1_combinedtransit'])*IV_carbusmetro))
+                    else:
+                        has_combinedtransit_nest = 0
+                        IV_1_combinedtransit = np.zeros(self.num_assign_interval)
+                    
+                    prob_1_driving = np.exp(theta_dict['theta_1_driving'] * IV_1_driving) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                             has_bus_nest * np.exp(theta_dict['theta_1_bus'] * IV_1_bus) + \
+                                                                                             has_metro_nest * np.exp(theta_dict['theta_1_metro'] * IV_1_metro) + \
+                                                                                             has_combinedtransit_nest * np.exp(theta_dict['theta_1_combinedtransit'] * IV_1_combinedtransit))
+                    prob_car = np.ones(self.num_assign_interval)
+                    final_path_prob_car = prob_1_driving * prob_car * path_prob_car # note the dimensions: path_prob_car is a 2D array
+                    path_flow = q_e_traveler[OD_index] * final_path_prob_car
+                    f_car_driving = f_car_driving + list(path_flow)
+                    k_probs_driving = k_probs_driving + list(path_prob_car)
+                    gm_probs_driving = gm_probs_driving + [prob_car]*len(path_prob_car)
+                    m_probs_driving = m_probs_driving + [prob_1_driving]*len(path_prob_car)
+
+                    if has_IV_bus or has_IV_metro or has_IV_busmetro:
+                        path_flow_f_transit = list(np.zeros((len(OD_path_type_list_transit[O][D]),self.num_assign_interval)))
+                        k_prob_list_transit, gm_prob_list_transit, m_prob_list_transit = list(np.zeros(len(OD_path_type_list_transit[O][D]))), \
+                        list(np.zeros(len(OD_path_type_list_transit[O][D]))), list(np.zeros(len(OD_path_type_list_transit[O][D])))
+                    if has_IV_carbus or has_IV_carmetro or has_IV_carbusmetro:
+                        path_flow_f_pnr = list(np.zeros((len(OD_path_type_list_pnr[O][D]),self.num_assign_interval)))
+                        k_prob_list_pnr, gm_prob_list_pnr, m_prob_list_pnr = list(np.zeros(len(OD_path_type_list_pnr[O][D]))), \
+                        list(np.zeros(len(OD_path_type_list_pnr[O][D]))), list(np.zeros(len(OD_path_type_list_pnr[O][D])))
+                    
+                    if has_IV_bus or has_IV_carbus:
+                        prob_1_bus = np.exp(theta_dict['theta_1_bus'] * IV_1_bus) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                     has_bus_nest * np.exp(theta_dict['theta_1_bus'] * IV_1_bus) + \
+                                                                                     has_metro_nest * np.exp(theta_dict['theta_1_metro'] * IV_1_metro) + \
+                                                                                     has_combinedtransit_nest * np.exp(theta_dict['theta_1_combinedtransit'] * IV_1_combinedtransit))
+                        second_level_denom = has_IV_bus * np.exp((theta_dict['theta_bus']/theta_dict['theta_1_bus'])*IV_bus) + \
+                            has_IV_carbus * np.exp((theta_dict['theta_carbus']/theta_dict['theta_1_bus'])*IV_carbus)
+                        if has_IV_bus:
+                            prob_bus = np.exp((theta_dict['theta_bus']/theta_dict['theta_1_bus'])*IV_bus) / second_level_denom
+                            final_path_prob_bus = prob_1_bus * prob_bus * path_prob_bus
+                            path_flow_bus = q_e_traveler[OD_index] * final_path_prob_bus
+                            for i in range(len(path_indices_bus)):
+                                path_flow_f_transit[path_indices_bus[i]] = path_flow_bus[i]
+                                k_prob_list_transit[path_indices_bus[i]] = path_prob_bus[i]
+                                gm_prob_list_transit[path_indices_bus[i]] = prob_bus
+                                m_prob_list_transit[path_indices_bus[i]] = prob_1_bus
+                        if has_IV_carbus:
+                            prob_carbus = np.exp((theta_dict['theta_carbus']/theta_dict['theta_1_bus'])*IV_carbus) / second_level_denom
+                            final_path_prob_carbus = prob_1_bus * prob_carbus * path_prob_carbus
+                            path_flow_carbus = q_e_traveler[OD_index] * final_path_prob_carbus
+                            for i in range(len(path_indices_carbus)):
+                                path_flow_f_pnr[path_indices_carbus[i]] = path_flow_carbus[i]
+                                k_prob_list_pnr[path_indices_carbus[i]] = path_prob_carbus[i]
+                                gm_prob_list_pnr[path_indices_carbus[i]] = prob_carbus
+                                m_prob_list_pnr[path_indices_carbus[i]] = prob_1_bus
+
+                    if has_IV_metro or has_IV_carmetro:
+                        prob_1_metro = np.exp(theta_dict['theta_1_metro'] * IV_1_metro) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                         has_bus_nest * np.exp(theta_dict['theta_1_bus'] * IV_1_bus) + \
+                                                                                         has_metro_nest * np.exp(theta_dict['theta_1_metro'] * IV_1_metro) + \
+                                                                                         has_combinedtransit_nest * np.exp(theta_dict['theta_1_combinedtransit'] * IV_1_combinedtransit))
+                        second_level_denom = has_IV_metro * np.exp((theta_dict['theta_metro']/theta_dict['theta_1_metro'])*IV_metro) + \
+                            has_IV_carmetro * np.exp((theta_dict['theta_carmetro']/theta_dict['theta_1_metro'])*IV_carmetro)
+                        if has_IV_metro:
+                            prob_metro = np.exp((theta_dict['theta_metro']/theta_dict['theta_1_metro'])*IV_metro) / second_level_denom
+                            final_path_prob_metro = prob_1_metro * prob_metro * path_prob_metro
+                            path_flow_metro = q_e_traveler[OD_index] * final_path_prob_metro
+                            for i in range(len(path_indices_metro)):
+                                path_flow_f_transit[path_indices_metro[i]] = path_flow_metro[i]
+                                k_prob_list_transit[path_indices_metro[i]] = path_prob_metro[i]
+                                gm_prob_list_transit[path_indices_metro[i]] = prob_metro
+                                m_prob_list_transit[path_indices_metro[i]] = prob_1_metro
+                        if has_IV_carmetro:
+                            prob_carmetro = np.exp((theta_dict['theta_carmetro']/theta_dict['theta_1_metro'])*IV_carmetro) / second_level_denom
+                            final_path_prob_carmetro = prob_1_metro * prob_carmetro * path_prob_carmetro
+                            path_flow_carmetro = q_e_traveler[OD_index] * final_path_prob_carmetro
+                            for i in range(len(path_indices_carmetro)):
+                                path_flow_f_pnr[path_indices_carmetro[i]] = path_flow_carmetro[i]
+                                k_prob_list_pnr[path_indices_carmetro[i]] = path_prob_carmetro[i]
+                                gm_prob_list_pnr[path_indices_carmetro[i]] = prob_carmetro
+                                m_prob_list_pnr[path_indices_carmetro[i]] = prob_1_metro
+
+                    if has_IV_busmetro or has_IV_carbusmetro:
+                        prob_1_combinedtransit = np.exp(theta_dict['theta_1_combinedtransit'] * IV_1_combinedtransit) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                                                 has_bus_nest * np.exp(theta_dict['theta_1_bus'] * IV_1_bus) + \
+                                                                                                                 has_metro_nest * np.exp(theta_dict['theta_1_metro'] * IV_1_metro) + \
+                                                                                                                 has_combinedtransit_nest * np.exp(theta_dict['theta_1_combinedtransit'] * IV_1_combinedtransit))
+                        second_level_denom = has_IV_busmetro * np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_combinedtransit'])*IV_busmetro) + \
+                            has_IV_carbusmetro * np.exp((theta_dict['theta_carbusmetro']/theta_dict['theta_1_combinedtransit'])*IV_carbusmetro)
+                        if has_IV_busmetro:
+                            prob_busmetro = np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_combinedtransit'])*IV_busmetro) / second_level_denom
+                            final_path_prob_busmetro = prob_1_combinedtransit * prob_busmetro * path_prob_busmetro
+                            path_flow_busmetro = q_e_traveler[OD_index] * final_path_prob_busmetro
+                            for i in range(len(path_indices_busmetro)):
+                                path_flow_f_transit[path_indices_busmetro[i]] = path_flow_busmetro[i]
+                                k_prob_list_transit[path_indices_busmetro[i]] = path_prob_busmetro[i]
+                                gm_prob_list_transit[path_indices_busmetro[i]] = prob_busmetro
+                                m_prob_list_transit[path_indices_busmetro[i]] = prob_1_combinedtransit
+                        if has_IV_carbusmetro:
+                            prob_carbusmetro = np.exp((theta_dict['theta_carbusmetro']/theta_dict['theta_1_combinedtransit'])*IV_carbusmetro) / second_level_denom
+                            final_path_prob_carbusmetro = prob_1_combinedtransit * prob_carbusmetro * path_prob_carbusmetro
+                            path_flow_carbusmetro = q_e_traveler[OD_index] * final_path_prob_carbusmetro
+                            for i in range(len(path_indices_carbusmetro)):
+                                path_flow_f_pnr[path_indices_carbusmetro[i]] = path_flow_carbusmetro[i]
+                                k_prob_list_pnr[path_indices_carbusmetro[i]] = path_prob_carbusmetro[i]
+                                gm_prob_list_pnr[path_indices_carbusmetro[i]] = prob_carbusmetro
+                                m_prob_list_pnr[path_indices_carbusmetro[i]] = prob_1_combinedtransit
+
+                    if row['BusTransit'].values[0] == 1:
+                        f_transit = f_transit + path_flow_f_transit
+                        k_probs_transit = k_probs_transit + k_prob_list_transit
+                        gm_probs_transit = gm_probs_transit + gm_prob_list_transit
+                        m_probs_transit = m_probs_transit + m_prob_list_transit
+
+                    if row['PNR'].values[0] == 1:
+                        f_pnr = f_pnr + list(path_flow_f_pnr)
+                        k_probs_pnr = k_probs_pnr + k_prob_list_pnr
+                        gm_probs_pnr = gm_probs_pnr + gm_prob_list_pnr
+                        m_probs_pnr = m_probs_pnr + m_prob_list_pnr
+                
+                else: # nested_type == 3
+                    IV_1_driving = np.log(np.exp((theta_dict['theta_car'] / theta_dict['theta_1_driving']) * IV_car) + has_IV_carbus * np.exp((theta_dict['theta_carbus'] / \
+                                                                                                                                               theta_dict['theta_1_driving']) * IV_carbus) + 
+                                        has_IV_carmetro * np.exp((theta_dict['theta_carmetro'] / theta_dict['theta_1_driving']) * IV_carmetro) )
+                    if row['BusTransit'].values[0] == 1:
+                        has_transit_nest = 1
+                        IV_1_transit = np.log(has_IV_bus * np.exp((theta_dict['theta_bus']/theta_dict['theta_1_transit'])*IV_bus) + \
+                                             has_IV_metro * np.exp((theta_dict['theta_metro']/theta_dict['theta_1_transit'])*IV_metro) + \
+                                             has_IV_busmetro * np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_transit'])*IV_busmetro))
+                    else:
+                        has_transit_nest = 0
+                        IV_1_transit = np.zeros(self.num_assign_interval)
+
+                    if row['PNR'].values[0] == 1:
+                        path_flow_f_pnr = list(np.zeros((len(OD_path_type_list_pnr[O][D]),self.num_assign_interval)))
+                        k_prob_list_pnr, gm_prob_list_pnr, m_prob_list_pnr = list(np.zeros(len(OD_path_type_list_pnr[O][D]))), \
+                            list(np.zeros(len(OD_path_type_list_pnr[O][D]))), list(np.zeros(len(OD_path_type_list_pnr[O][D])))
+                    if row['BusTransit'].values[0] == 1:
+                        path_flow_f_transit = list(np.zeros((len(OD_path_type_list_transit[O][D]),self.num_assign_interval)))
+                        k_prob_list_transit, gm_prob_list_transit, m_prob_list_transit = list(np.zeros(len(OD_path_type_list_transit[O][D]))), \
+                        list(np.zeros(len(OD_path_type_list_transit[O][D]))), list(np.zeros(len(OD_path_type_list_transit[O][D])))
+                    
+                    prob_1_driving = np.exp(theta_dict['theta_1_driving'] * IV_1_driving) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                             has_transit_nest * np.exp(theta_dict['theta_1_transit'] * IV_1_transit))
+                    second_level_denom = np.exp(theta_dict['theta_car'] / theta_dict['theta_1_driving'] * IV_car) + \
+                        has_IV_carbus * np.exp((theta_dict['theta_carbus'] / theta_dict['theta_1_driving']) * IV_carbus) + \
+                            has_IV_carmetro * np.exp((theta_dict['theta_carmetro'] / theta_dict['theta_1_driving']) * IV_carmetro) +\
+                            has_IV_carbusmetro * np.exp((theta_dict['theta_carbusmetro'] / theta_dict['theta_1_driving']) * IV_carbusmetro)
+                    prob_car = np.exp((theta_dict['theta_car'] / theta_dict['theta_1_driving']) * IV_car) / second_level_denom
+                    final_path_prob_car = prob_1_driving * prob_car * path_prob_car
+                    path_flow = q_e_traveler[OD_index] * final_path_prob_car
+                    f_car_driving = f_car_driving +list(path_flow)
+                    k_probs_driving = k_probs_driving + list(path_prob_car)
+                    gm_probs_driving = gm_probs_driving + [prob_car]*len(path_prob_car)
+                    m_probs_driving = m_probs_driving + [prob_1_driving]*len(path_prob_car)
+                    if has_IV_carbus:
+                        prob_carbus = np.exp((theta_dict['theta_carbus'] / theta_dict['theta_1_driving']) * IV_carbus) / second_level_denom
+                        final_path_prob_carbus = prob_1_driving * prob_carbus * path_prob_carbus
+                        path_flow_carbus = q_e_traveler[OD_index] * final_path_prob_carbus
+                        for i in range(len(path_indices_carbus)):
+                            path_flow_f_pnr[path_indices_carbus[i]] = path_flow_carbus[i]
+                            k_prob_list_pnr[path_indices_carbus[i]] = path_prob_carbus[i]
+                            gm_prob_list_pnr[path_indices_carbus[i]] = prob_carbus
+                            m_prob_list_pnr[path_indices_carbus[i]] = prob_1_driving
+                    if has_IV_carmetro:
+                        prob_carmetro = np.exp((theta_dict['theta_carmetro'] / theta_dict['theta_1_driving']) * IV_carmetro) / second_level_denom
+                        final_path_prob_carmetro = prob_1_driving * prob_carmetro * path_prob_carmetro
+                        path_flow_carmetro = q_e_traveler[OD_index] * final_path_prob_carmetro
+                        for i in range(len(path_indices_carmetro)):
+                            path_flow_f_pnr[path_indices_carmetro[i]] = path_flow_carmetro[i]
+                            k_prob_list_pnr[path_indices_carmetro[i]] = path_prob_carmetro[i]
+                            gm_prob_list_pnr[path_indices_carmetro[i]] = prob_carmetro
+                            m_prob_list_pnr[path_indices_carmetro[i]] = prob_1_driving
+                    if has_IV_carbusmetro:
+                        prob_carbusmetro = np.exp((theta_dict['theta_carbusmetro'] / theta_dict['theta_1_driving']) * IV_carbusmetro) / second_level_denom
+                        final_path_prob_carbusmetro = prob_1_driving * prob_carbusmetro * path_prob_carbusmetro
+                        path_flow_carbusmetro = q_e_traveler[OD_index] * final_path_prob_carbusmetro
+                        for i in range(len(path_indices_carbusmetro)):
+                            path_flow_f_pnr[path_indices_carbusmetro[i]] = path_flow_carbusmetro[i]
+                            k_prob_list_pnr[path_indices_carbusmetro[i]] = path_prob_carbusmetro[i]
+                            gm_prob_list_pnr[path_indices_carbusmetro[i]] = prob_carbusmetro
+                            m_prob_list_pnr[path_indices_carbusmetro[i]] = prob_1_driving
+
+                    if has_transit_nest == 1:
+                        prob_1_transit = np.exp(theta_dict['theta_1_transit'] * IV_1_transit) / (np.exp(theta_dict['theta_1_driving'] * IV_1_driving) + \
+                                                                                                 np.exp(theta_dict['theta_1_transit'] * IV_1_transit))
+                        second_level_denom = has_IV_bus * np.exp((theta_dict['theta_bus']/theta_dict['theta_1_transit'])*IV_bus) + \
+                            has_IV_metro * np.exp((theta_dict['theta_metro']/theta_dict['theta_1_transit'])*IV_metro) + \
+                            has_IV_busmetro * np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_transit'])*IV_busmetro)
+                        if has_IV_bus:
+                            prob_bus = np.exp((theta_dict['theta_bus']/theta_dict['theta_1_transit'])*IV_bus) / second_level_denom
+                            final_path_prob_bus = prob_1_transit * prob_bus * path_prob_bus
+                            path_flow_bus = q_e_traveler[OD_index] * final_path_prob_bus
+                            for i in range(len(path_indices_bus)):
+                                path_flow_f_transit[path_indices_bus[i]] = path_flow_bus[i]
+                                k_prob_list_transit[path_indices_bus[i]] = path_prob_bus[i]
+                                gm_prob_list_transit[path_indices_bus[i]] = prob_bus
+                                m_prob_list_transit[path_indices_bus[i]] = prob_1_transit
+                        if has_IV_metro:
+                            prob_metro = np.exp((theta_dict['theta_metro']/theta_dict['theta_1_transit'])*IV_metro) / second_level_denom
+                            final_path_prob_metro = prob_1_transit * prob_metro * path_prob_metro
+                            path_flow_metro = q_e_traveler[OD_index] * final_path_prob_metro
+                            for i in range(len(path_indices_metro)):
+                                path_flow_f_transit[path_indices_metro[i]] = path_flow_metro[i]
+                                k_prob_list_transit[path_indices_metro[i]] = path_prob_metro[i]
+                                gm_prob_list_transit[path_indices_metro[i]] = prob_metro
+                                m_prob_list_transit[path_indices_metro[i]] = prob_1_transit
+                        if has_IV_busmetro:
+                            prob_busmetro = np.exp((theta_dict['theta_busmetro']/theta_dict['theta_1_transit'])*IV_busmetro) / second_level_denom
+                            final_path_prob_busmetro = prob_1_transit * prob_busmetro * path_prob_busmetro
+                            path_flow_busmetro = q_e_traveler[OD_index] * final_path_prob_busmetro
+                            for i in range(len(path_indices_busmetro)):
+                                path_flow_f_transit[path_indices_busmetro[i]] = path_flow_busmetro[i]
+                                k_prob_list_transit[path_indices_busmetro[i]] = path_prob_busmetro[i]
+                                gm_prob_list_transit[path_indices_busmetro[i]] = prob_busmetro
+                                m_prob_list_transit[path_indices_busmetro[i]] = prob_1_transit
+                        f_transit = f_transit + path_flow_f_transit
+                        k_probs_transit = k_probs_transit + k_prob_list_transit
+                        gm_probs_transit = gm_probs_transit + gm_prob_list_transit
+                        m_probs_transit = m_probs_transit + m_prob_list_transit
+
+                    if row['PNR'].values[0] == 1:
+                        f_pnr = f_pnr + path_flow_f_pnr
+                        k_probs_pnr = k_probs_pnr + k_prob_list_pnr
+                        gm_probs_pnr = gm_probs_pnr + gm_prob_list_pnr
+                        m_probs_pnr = m_probs_pnr + m_prob_list_pnr
+        f_car_driving = np.array(f_car_driving)
+        f_transit = np.array(f_transit)
+        f_pnr = np.array(f_pnr)
+        assert(f_car_driving.shape == (self.num_path_driving, self.num_assign_interval))
+        assert(f_transit.shape == (self.num_path_bustransit, self.num_assign_interval))
+        assert(f_pnr.shape == (self.num_path_pnr, self.num_assign_interval))
+        f_car_driving = f_car_driving.flatten(order='F')
+        f_transit = f_transit.flatten(order='F')
+        f_pnr = f_pnr.flatten(order='F')
+
+        assert all(not np.isnan(arr).any() for arr in k_probs_driving)
+        assert all(not np.isnan(arr).any() for arr in k_probs_transit)
+        assert all(not np.isnan(arr).any() for arr in k_probs_pnr)
+        assert all(not np.isnan(arr).any() for arr in gm_probs_driving)
+        assert all(not np.isnan(arr).any() for arr in gm_probs_transit)
+        assert all(not np.isnan(arr).any() for arr in gm_probs_pnr)
+        assert all(not np.isnan(arr).any() for arr in m_probs_driving)
+        assert all(not np.isnan(arr).any() for arr in m_probs_transit)
+        assert all(not np.isnan(arr).any() for arr in m_probs_pnr)
+
+        probs_record_dict = {'k_probs_driving': k_probs_driving, 'k_probs_transit': k_probs_transit, 'k_probs_pnr': k_probs_pnr,
+                             'gm_probs_driving': gm_probs_driving, 'gm_probs_transit': gm_probs_transit, 'gm_probs_pnr': gm_probs_pnr,
+                             'm_probs_driving': m_probs_driving, 'm_probs_transit': m_probs_transit, 'm_probs_pnr': m_probs_pnr}
+        
+        return f_car_driving, f_transit, f_pnr, probs_record_dict
+    
+    def compute_para_derivatives(self, input_file_folder, q_e_traveler, nested_type, theta_dict, OD_path_tt_list_driving, OD_path_alltts_list_transit, OD_path_alltts_list_pnr,
+                                 probs_record_dict):
+        
+        # with open(os.path.join(input_file_folder, 'probs_record_dict.pickle'), 'wb') as f:
+        #     pickle.dump(probs_record_dict, f)
+
+        with open(os.path.join(input_file_folder, 'disutility_info_df.pickle'), 'rb') as f:
+            disutility_info_df = pickle.load(f)
+        with open(os.path.join(input_file_folder, 'dode_data.pickle'), 'rb') as f:
+            [_, _, _, _, _, _, _, \
+            _, OD_path_type_list_transit,OD_path_type_list_pnr] = pickle.load(f)
+        bus_fare = self.nb.config.config_dict['MMDUE']['bus_fare']
+        metro_fare =self.nb.config.config_dict['MMDUE']['metro_fare']
+        q_e_traveler = q_e_traveler.reshape((int(len(q_e_traveler) / self.num_assign_interval), self.num_assign_interval), order='F')
+
+        beta_der_dict = dict()
+        for string1 in ['beta_tt_car', 'beta_tt_bus', 'beta_tt_metro', 'beta_walking', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_money']:
+            beta_der_dict[string1] = dict()
+        beta_der_dict['beta_tt_car']['driving'], beta_der_dict['beta_tt_car']['pnr'] = np.zeros((self.num_path_driving, self.num_assign_interval)), np.zeros((self.num_path_pnr, self.num_assign_interval))
+        beta_der_dict['beta_tt_bus']['transit'], beta_der_dict['beta_tt_bus']['pnr'] = np.zeros((self.num_path_bustransit, self.num_assign_interval)), np.zeros((self.num_path_pnr, self.num_assign_interval))
+        beta_der_dict['beta_tt_metro']['transit'], beta_der_dict['beta_tt_metro']['pnr'] = np.zeros((self.num_path_bustransit, self.num_assign_interval)), np.zeros((self.num_path_pnr, self.num_assign_interval))
+        beta_der_dict['beta_walking']['transit'], beta_der_dict['beta_walking']['pnr'] = np.zeros((self.num_path_bustransit, self.num_assign_interval)), np.zeros((self.num_path_pnr, self.num_assign_interval))
+        beta_der_dict['beta_waiting_bus']['transit'], beta_der_dict['beta_waiting_bus']['pnr'] = np.zeros((self.num_path_bustransit, self.num_assign_interval)), np.zeros((self.num_path_pnr, self.num_assign_interval))
+        beta_der_dict['beta_waiting_metro']['transit'], beta_der_dict['beta_waiting_metro']['pnr'] = np.zeros((self.num_path_bustransit, self.num_assign_interval)), np.zeros((self.num_path_pnr, self.num_assign_interval))
+        beta_der_dict['beta_money']['driving'], beta_der_dict['beta_money']['transit'], beta_der_dict['beta_money']['pnr'] = np.zeros((self.num_path_driving, self.num_assign_interval)), np.zeros((self.num_path_bustransit, \
+                                                                                                                                                                                                    self.num_assign_interval)), np.zeros((self.num_path_pnr, self.num_assign_interval))
+        gamma_der_dict = dict()
+        for string1 in ['income', 'Originpopden', 'Destpopden']:
+            gamma_der_dict['gamma_' + string1 + '_car'] = np.zeros((self.num_path_driving, self.num_assign_interval))
+            for string2 in ['bus', 'metro', 'busmetro']:
+                gamma_der_dict['gamma_' + string1 + '_' + string2] = np.zeros((self.num_path_bustransit, self.num_assign_interval))
+            for string2 in ['carbus', 'carmetro', 'carbusmetro']:
+                gamma_der_dict['gamma_' + string1 + '_' + string2] = np.zeros((self.num_path_pnr, self.num_assign_interval))
+
+        alpha_der_dict = dict()
+        for string1 in ['bus', 'metro', 'busmetro']:
+            alpha_der_dict['alpha_' + string1] = np.zeros((self.num_path_bustransit, self.num_assign_interval))
+        for string1 in ['carbus', 'carmetro', 'carbusmetro']:
+            alpha_der_dict['alpha_' + string1] = np.zeros((self.num_path_pnr, self.num_assign_interval))
+
+
+        # second derivatives (Hessian): inside each dict, the first key is the name of the parameter, the second key is the name of the parameter that it is derived with respect to
+        beta_2nd_der_dict = dict()
+        for string1 in ['beta_tt_car', 'beta_tt_bus', 'beta_tt_metro', 'beta_walking', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_money']:
+            beta_2nd_der_dict[string1] = dict()
+        gamma_2nd_der_dict = dict()
+        for string1 in ['income', 'Originpopden', 'Destpopden']:
+            gamma_2nd_der_dict['gamma_' + string1 + '_car'] = dict()
+            for string2 in ['bus', 'metro', 'busmetro']:
+                gamma_2nd_der_dict['gamma_' + string1 + '_' + string2] = dict()
+            for string2 in ['carbus', 'carmetro', 'carbusmetro']:
+                gamma_2nd_der_dict['gamma_' + string1 + '_' + string2] = dict()
+        alpha_2nd_der_dict = dict()
+        for string1 in ['bus', 'metro', 'busmetro']:
+            alpha_2nd_der_dict['alpha_' + string1] = dict()
+        for string1 in ['carbus', 'carmetro', 'carbusmetro']:
+            alpha_2nd_der_dict['alpha_' + string1] = dict()
+        # driving
+        for string1 in ['beta_tt_car', 'beta_money']:
+            for string2 in ['beta_tt_car', 'beta_money', 'gamma_income_car', 'gamma_Originpopden_car', 'gamma_Destpopden_car']:
+                beta_2nd_der_dict[string1][string2] = dict()
+                beta_2nd_der_dict[string1][string2]['driving'] = np.zeros((self.num_path_driving, self.num_assign_interval))
+                beta_2nd_der_dict[string1][string2]['pnr'] = np.zeros((self.num_path_pnr, self.num_assign_interval))
+                if string1 == 'beta_money':
+                    beta_2nd_der_dict[string1][string2]['transit'] = np.zeros((self.num_path_bustransit, self.num_assign_interval))
+        for string1 in ['gamma_income_car', 'gamma_Originpopden_car', 'gamma_Destpopden_car']:
+            for string2 in ['beta_tt_car', 'beta_money', 'gamma_income_car', 'gamma_Originpopden_car', 'gamma_Destpopden_car']:
+                gamma_2nd_der_dict[string1][string2] = np.zeros((self.num_path_driving, self.num_assign_interval))
+        # bustransit
+        for string2 in ['beta_tt_bus', 'beta_tt_metro', 'beta_walking', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_money', 'gamma_income_bus', 'gamma_Originpopden_bus', 'gamma_Destpopden_bus',
+                            'gamma_income_metro', 'gamma_Originpopden_metro', 'gamma_Destpopden_metro', 'gamma_income_busmetro', 'gamma_Originpopden_busmetro', 'gamma_Destpopden_busmetro',\
+                                'alpha_bus', 'alpha_metro', 'alpha_busmetro']:
+            for string1 in ['beta_tt_bus', 'beta_tt_metro', 'beta_walking', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_money']:
+                # if beta_2nd_der_dict[string1][string2] has not been defined as dict, then define it as dict
+                if beta_2nd_der_dict[string1].get(string2) == None:
+                    beta_2nd_der_dict[string1][string2] = dict()
+                beta_2nd_der_dict[string1][string2]['transit'] = np.zeros((self.num_path_bustransit, self.num_assign_interval))
+                beta_2nd_der_dict[string1][string2]['pnr'] = np.zeros((self.num_path_pnr, self.num_assign_interval))
+                if string1 == 'beta_money':
+                    beta_2nd_der_dict[string1][string2]['driving'] = np.zeros((self.num_path_driving, self.num_assign_interval))
+            for string1 in ['gamma_income_bus', 'gamma_Originpopden_bus', 'gamma_Destpopden_bus', 'gamma_income_metro', 'gamma_Originpopden_metro', 'gamma_Destpopden_metro', \
+                        'gamma_income_busmetro', 'gamma_Originpopden_busmetro', 'gamma_Destpopden_busmetro']:
+                gamma_2nd_der_dict[string1][string2] = np.zeros((self.num_path_bustransit, self.num_assign_interval))
+            for string1 in ['alpha_bus', 'alpha_metro', 'alpha_busmetro']:
+                alpha_2nd_der_dict[string1][string2] = np.zeros((self.num_path_bustransit, self.num_assign_interval))
+        # pnr
+        for string2 in ['beta_tt_car', 'beta_tt_bus', 'beta_tt_metro', 'beta_walking', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_money', 'gamma_income_carbus', 'gamma_Originpopden_carbus', 'gamma_Destpopden_carbus',
+                            'gamma_income_carmetro', 'gamma_Originpopden_carmetro', 'gamma_Destpopden_carmetro', 'gamma_income_carbusmetro', 'gamma_Originpopden_carbusmetro', 'gamma_Destpopden_carbusmetro', \
+                                'alpha_carbus', 'alpha_carmetro', 'alpha_carbusmetro']:
+            for string1 in ['beta_tt_car', 'beta_tt_bus', 'beta_tt_metro', 'beta_walking', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_money']:
+                if beta_2nd_der_dict[string1].get(string2) == None:
+                    beta_2nd_der_dict[string1][string2] = dict()
+                beta_2nd_der_dict[string1][string2]['pnr'] = np.zeros((self.num_path_pnr, self.num_assign_interval))
+                beta_2nd_der_dict[string1][string2]['transit'] = np.zeros((self.num_path_bustransit, self.num_assign_interval))
+                if string1 == 'beta_money' or string1 == 'beta_tt_car':
+                    beta_2nd_der_dict[string1][string2]['driving'] = np.zeros((self.num_path_driving, self.num_assign_interval))
+            for string1 in ['gamma_income_carbus', 'gamma_Originpopden_carbus', 'gamma_Destpopden_carbus', 'gamma_income_carmetro', 'gamma_Originpopden_carmetro', 'gamma_Destpopden_carmetro', \
+                        'gamma_income_carbusmetro', 'gamma_Originpopden_carbusmetro', 'gamma_Destpopden_carbusmetro']:
+                gamma_2nd_der_dict[string1][string2] = np.zeros((self.num_path_pnr, self.num_assign_interval))
+            for string1 in ['alpha_carbus', 'alpha_carmetro', 'alpha_carbusmetro']:
+                alpha_2nd_der_dict[string1][string2] = np.zeros((self.num_path_pnr, self.num_assign_interval))
+
+                
+        #****************** for testing purpose only ********************
+        if probs_record_dict == None:
+            return beta_der_dict, gamma_der_dict, alpha_der_dict, beta_2nd_der_dict, gamma_2nd_der_dict, alpha_2nd_der_dict
+
+        #****************************************************************
+
+        OD_idx, path_driving_idx, path_transit_idx, path_pnr_idx = -1, -1, -1, -1
+        for O in OD_path_tt_list_driving:
+            for D in OD_path_tt_list_driving[O]:
+                OD_idx += 1
+                for i in range(len(OD_path_tt_list_driving[O][D])):
+                    path_driving_idx += 1
+                    A = probs_record_dict['m_probs_driving'][path_driving_idx]
+                    B = probs_record_dict['gm_probs_driving'][path_driving_idx]
+                    C = probs_record_dict['k_probs_driving'][path_driving_idx]
+                    # same for all the nested types
+                    temp_fi = -1/theta_dict['theta_car']* (1-C) - 1/theta_dict['theta_1_driving'] * C * (1-B) - C*B * (1-A)
+                    f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                    f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_car']**2) + (1-B)/(theta_dict['theta_car']*theta_dict['theta_1_driving']) + B*(1-A)/theta_dict['theta_car']) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_driving']**2) + B*(1-B)*(1-A)/theta_dict['theta_1_driving'] - B**2 * A * (1-A)))
+                    assert not np.isnan(f_der_c).any()
+                    beta_der_dict['beta_tt_car']['driving'][path_driving_idx] = f_der_c * OD_path_tt_list_driving[O][D][i] / 60
+                    beta_der_dict['beta_money']['driving'][path_driving_idx] = f_der_c * disutility_info_df[disutility_info_df['D_id'] == D]['parking_fee'].values[0]
+                    gamma_der_dict['gamma_income_car'][path_driving_idx] = f_der_c * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0]
+                    gamma_der_dict['gamma_Originpopden_car'][path_driving_idx] = f_der_c * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0]
+                    gamma_der_dict['gamma_Destpopden_car'][path_driving_idx] = f_der_c * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0]
+
+                    coef = dict()
+                    coef['beta_tt_car'], coef['beta_money'], coef['gamma_income_car'], coef['gamma_Originpopden_car'], coef['gamma_Destpopden_car']  = OD_path_tt_list_driving[O][D][i] / 60,\
+                        disutility_info_df[disutility_info_df['D_id'] == D]['parking_fee'].values[0], disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0], \
+                        disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0], disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0]
+                    for string2 in ['beta_tt_car', 'beta_money', 'gamma_income_car', 'gamma_Originpopden_car', 'gamma_Destpopden_car']:
+                        for string1 in ['beta_tt_car', 'beta_money']:
+                            beta_2nd_der_dict[string1][string2]['driving'][path_driving_idx] = f_2nd_der_c * coef[string1] * coef[string2]
+                        for string1 in ['gamma_income_car', 'gamma_Originpopden_car', 'gamma_Destpopden_car']:
+                            gamma_2nd_der_dict[string1][string2][path_driving_idx] = f_2nd_der_c * coef[string1] * coef[string2]
+                    
+                if O in OD_path_type_list_transit:
+                    if D in OD_path_type_list_transit[O]:
+                        for i in range(len(OD_path_type_list_transit[O][D])):
+                            path_transit_idx += 1
+                            A = probs_record_dict['m_probs_transit'][path_transit_idx]
+                            B = probs_record_dict['gm_probs_transit'][path_transit_idx]
+                            C = probs_record_dict['k_probs_transit'][path_transit_idx]
+                            assert not np.isnan(A).any()
+                            assert not np.isnan(B).any()
+                            assert not np.isnan(C).any()
+                            assert not np.isinf(A).any()
+                            assert not np.isinf(B).any()
+                            assert not np.isinf(C).any()
+                            string1 = re.sub(r'[^a-zA-Z]', '', OD_path_type_list_transit[O][D][i])
+                            if nested_type == 1 or nested_type == 3:
+                                temp_fi = -1/theta_dict['theta_' + string1]* (1-C) - 1/theta_dict['theta_1_transit'] * C * (1-B) - C*B * (1-A)
+                                f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                                f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_' + string1]**2) + (1-B)/(theta_dict['theta_' + string1]*theta_dict['theta_1_transit']) + B*(1-A)/theta_dict['theta_' + string1]) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_transit']**2) + B*(1-B)*(1-A)/theta_dict['theta_1_transit'] - B**2 * A * (1-A)))
+                            else:
+                                if OD_path_type_list_transit[O][D][i] == 'bus+metro':
+                                    temp_fi = -1/theta_dict['theta_' + string1]* (1-C) - 1/theta_dict['theta_1_combinedtransit'] * C * (1-B) - C*B * (1-A)
+                                    f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                                    f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_' + string1]**2) + (1-B)/(theta_dict['theta_' + string1]*theta_dict['theta_1_combinedtransit']) + B*(1-A)/theta_dict['theta_' + string1]) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_combinedtransit']**2) + B*(1-B)*(1-A)/theta_dict['theta_1_combinedtransit'] - B**2 * A * (1-A)))
+                                else:
+                                    temp_fi = -1/theta_dict['theta_' + string1]* (1-C) - 1/theta_dict['theta_1_' + string1] * C * (1-B) - C*B * (1-A)
+                                    f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                                    f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_' + string1]**2) + (1-B)/(theta_dict['theta_' + string1]*theta_dict['theta_1_' + string1]) + B*(1-A)/theta_dict['theta_' + string1]) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_' + string1]**2) + B*(1-B)*(1-A)/theta_dict['theta_1_' + string1] - B**2 * A * (1-A)))
+                            assert not np.isnan(q_e_traveler[OD_idx]).any()
+                            assert not np.isinf(q_e_traveler[OD_idx]).any()
+                            assert not np.isnan(f_der_c).any()
+                            assert not np.isinf(f_der_c).any()
+                            assert not np.isinf(OD_path_alltts_list_transit[O][D][i]['bus']).any()
+                            assert not np.isnan(OD_path_alltts_list_transit[O][D][i]['bus']).any()
+                            beta_der_dict['beta_tt_bus']['transit'][path_transit_idx] = f_der_c * OD_path_alltts_list_transit[O][D][i]['bus'] / 60
+                            beta_der_dict['beta_tt_metro']['transit'][path_transit_idx] = f_der_c * OD_path_alltts_list_transit[O][D][i]['metro'] / 60
+                            beta_der_dict['beta_waiting_bus']['transit'][path_transit_idx] = f_der_c * OD_path_alltts_list_transit[O][D][i]['bus_waiting'] /60
+                            beta_der_dict['beta_waiting_metro']['transit'][path_transit_idx] = f_der_c * OD_path_alltts_list_transit[O][D][i]['metro_waiting'] /60
+                            beta_der_dict['beta_walking']['transit'][path_transit_idx] = f_der_c * OD_path_alltts_list_transit[O][D][i]['walking'] /60
+                            has_bus = 1 if 'bus' in string1 else 0
+                            has_metro = 1 if 'metro' in string1 else 0
+                            beta_der_dict['beta_money']['transit'][path_transit_idx] = f_der_c * (bus_fare * has_bus + metro_fare * has_metro)
+                            gamma_der_dict['gamma_income_' + string1][path_transit_idx] = f_der_c * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0]
+                            gamma_der_dict['gamma_Originpopden_' + string1][path_transit_idx] = f_der_c * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0]
+                            gamma_der_dict['gamma_Destpopden_' + string1][path_transit_idx] = f_der_c * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0]
+                            alpha_der_dict['alpha_' + string1][path_transit_idx] = f_der_c
+
+                            coef = dict()
+                            coef['beta_tt_bus'], coef['beta_tt_metro'], coef['beta_waiting_bus'], coef['beta_waiting_metro'], coef['beta_walking'], coef['beta_money'], \
+                                coef['gamma_income_' + string1], coef['gamma_Originpopden_' + string1], coef['gamma_Destpopden_' + string1], coef['alpha_' + string1] = OD_path_alltts_list_transit[O][D][i]['bus'] / 60, \
+                                OD_path_alltts_list_transit[O][D][i]['metro'] / 60, OD_path_alltts_list_transit[O][D][i]['bus_waiting'] / 60, OD_path_alltts_list_transit[O][D][i]['metro_waiting'] / 60, \
+                                OD_path_alltts_list_transit[O][D][i]['walking'] / 60, bus_fare * has_bus + metro_fare * has_metro, \
+                                disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0], disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0], \
+                                disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0], 1
+                            for string3 in ['beta_tt_bus', 'beta_tt_metro', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_walking', 'beta_money', 'gamma_income_' + string1, 'gamma_Originpopden_' + string1, \
+                                            'gamma_Destpopden_' + string1, 'alpha_' + string1]:
+                                for string2 in ['beta_tt_bus', 'beta_tt_metro', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_walking', 'beta_money']:
+                                    beta_2nd_der_dict[string2][string3]['transit'][path_transit_idx] = f_2nd_der_c * coef[string2] * coef[string3]
+                                for string2 in ['gamma_income_' + string1, 'gamma_Originpopden_' + string1, 'gamma_Destpopden_' + string1]:
+                                    gamma_2nd_der_dict[string2][string3][path_transit_idx] = f_2nd_der_c * coef[string2] * coef[string3]
+                                for string2 in ['alpha_' + string1]:
+                                    alpha_2nd_der_dict[string2][string3][path_transit_idx] = f_2nd_der_c * coef[string2] * coef[string3] 
+
+                if O in OD_path_type_list_pnr:
+                    if D in OD_path_type_list_pnr[O]:
+                        for i in range(len(OD_path_type_list_pnr[O][D])):
+                            path_pnr_idx += 1
+                            A = probs_record_dict['m_probs_pnr'][path_pnr_idx]
+                            B = probs_record_dict['gm_probs_pnr'][path_pnr_idx]
+                            C = probs_record_dict['k_probs_pnr'][path_pnr_idx]
+                            string1 = re.sub(r'[^a-zA-Z]', '', OD_path_type_list_pnr[O][D][i])
+                            if nested_type == 1:
+                                temp_fi = -1/theta_dict['theta_' + string1]* (1-C) - 1/theta_dict['theta_1_pnr'] * C * (1-B) - C*B * (1-A)
+                                f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                                f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_' + string1]**2) + (1-B)/(theta_dict['theta_' + string1]*theta_dict['theta_1_pnr']) + B*(1-A)/theta_dict['theta_' + string1]) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_pnr']**2) + B*(1-B)*(1-A)/theta_dict['theta_1_pnr'] - B**2 * A * (1-A)))
+                            elif nested_type == 2:
+                                if OD_path_type_list_pnr[O][D][i] == 'car+bus+metro':
+                                    temp_fi = -1/theta_dict['theta_' + string1]* (1-C) - 1/theta_dict['theta_1_combinedtransit'] * C * (1-B) - C*B * (1-A)
+                                    f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                                    f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_' + string1]**2) + (1-B)/(theta_dict['theta_' + string1]*theta_dict['theta_1_combinedtransit']) + B*(1-A)/theta_dict['theta_' + string1]) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_combinedtransit']**2) + B*(1-B)*(1-A)/theta_dict['theta_1_combinedtransit'] - B**2 * A * (1-A)))
+                                elif OD_path_type_list_pnr[O][D][i] == 'car+bus':
+                                    temp_fi = -1/theta_dict['theta_' + string1]* (1-C) - 1/theta_dict['theta_1_bus'] * C * (1-B) - C*B * (1-A)
+                                    f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                                    f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_' + string1]**2) + (1-B)/(theta_dict['theta_' + string1]*theta_dict['theta_1_bus']) + B*(1-A)/theta_dict['theta_' + string1]) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_bus']**2) + B*(1-B)*(1-A)/theta_dict['theta_1_bus'] - B**2 * A * (1-A)))
+                                else:
+                                    temp_fi = -1/theta_dict['theta_' + string1]* (1-C) - 1/theta_dict['theta_1_metro'] * C * (1-B) - C*B * (1-A)
+                                    f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                                    f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_' + string1]**2) + (1-B)/(theta_dict['theta_' + string1]*theta_dict['theta_1_metro']) + B*(1-A)/theta_dict['theta_' + string1]) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_metro']**2) + B*(1-B)*(1-A)/theta_dict['theta_1_metro'] - B**2 * A * (1-A)))
+                            else:
+                                temp_fi = -1/theta_dict['theta_' + string1]* (1-C) - 1/theta_dict['theta_1_driving'] * C * (1-B) - C*B * (1-A)
+                                f_der_c = q_e_traveler[OD_idx] * A * B * C * temp_fi
+                                f_2nd_der_c = q_e_traveler[OD_idx] * A * B * C * (temp_fi**2 + C*(1-C)*(-1/(theta_dict['theta_' + string1]**2) + (1-B)/(theta_dict['theta_' + string1]*theta_dict['theta_1_driving']) + B*(1-A)/theta_dict['theta_' + string1]) \
+                                                                      + C**2*(-B*(1-B)/(theta_dict['theta_1_driving']**2) + B*(1-B)*(1-A)/theta_dict['theta_1_driving'] - B**2 * A * (1-A)))
+                            assert not np.isnan(f_der_c).any()
+                            beta_der_dict['beta_tt_car']['pnr'][path_pnr_idx] = f_der_c * OD_path_alltts_list_pnr[O][D][i]['car'] / 60
+                            beta_der_dict['beta_tt_bus']['pnr'][path_pnr_idx] = f_der_c * OD_path_alltts_list_pnr[O][D][i]['bus'] / 60
+                            beta_der_dict['beta_tt_metro']['pnr'][path_pnr_idx] = f_der_c * OD_path_alltts_list_pnr[O][D][i]['metro'] /60
+                            beta_der_dict['beta_waiting_bus']['pnr'][path_pnr_idx] = f_der_c * OD_path_alltts_list_pnr[O][D][i]['bus_waiting'] /60
+                            beta_der_dict['beta_waiting_metro']['pnr'][path_pnr_idx] = f_der_c * OD_path_alltts_list_pnr[O][D][i]['metro_waiting'] /60
+                            beta_der_dict['beta_walking']['pnr'][path_pnr_idx] = f_der_c * OD_path_alltts_list_pnr[O][D][i]['walking'] / 60
+                            has_bus = 1 if 'bus' in string1 else 0
+                            has_metro = 1 if 'metro' in string1 else 0
+                            beta_der_dict['beta_money']['pnr'][path_pnr_idx] = f_der_c * (bus_fare * has_bus + metro_fare * has_metro + disutility_info_df['pnr_parking_fee'].values[0]) # again, assume pnr parking fee is the same for all pnr parking lots
+                            gamma_der_dict['gamma_income_' + string1][path_pnr_idx] = f_der_c * disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0]
+                            gamma_der_dict['gamma_Originpopden_' + string1][path_pnr_idx] = f_der_c * disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0]
+                            gamma_der_dict['gamma_Destpopden_' + string1][path_pnr_idx] = f_der_c * disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0]
+                            alpha_der_dict['alpha_' + string1][path_pnr_idx] = f_der_c
+
+                            coef = dict()
+                            coef['beta_tt_car'], coef['beta_tt_bus'], coef['beta_tt_metro'], coef['beta_waiting_bus'], coef['beta_waiting_metro'], coef['beta_walking'], coef['beta_money'], \
+                                coef['gamma_income_' + string1], coef['gamma_Originpopden_' + string1], coef['gamma_Destpopden_' + string1], coef['alpha_' + string1] = OD_path_alltts_list_pnr[O][D][i]['car'] / 60, \
+                                OD_path_alltts_list_pnr[O][D][i]['bus'] / 60, OD_path_alltts_list_pnr[O][D][i]['metro'] / 60, OD_path_alltts_list_pnr[O][D][i]['bus_waiting'] / 60, \
+                                OD_path_alltts_list_pnr[O][D][i]['metro_waiting'] / 60, OD_path_alltts_list_pnr[O][D][i]['walking'] / 60, bus_fare * has_bus + metro_fare * has_metro + disutility_info_df['pnr_parking_fee'].values[0], \
+                                disutility_info_df[disutility_info_df['O_id'] == O]['median_income'].values[0], disutility_info_df[disutility_info_df['O_id'] == O]['pop_den'].values[0], \
+                                disutility_info_df[disutility_info_df['D_id'] == D]['pop_den'].values[0], 1
+                            for string3 in ['beta_tt_car', 'beta_tt_bus', 'beta_tt_metro', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_walking', 'beta_money', 'gamma_income_' + string1, 'gamma_Originpopden_' + string1, \
+                                            'gamma_Destpopden_' + string1, 'alpha_' + string1]:
+                                for string2 in ['beta_tt_car', 'beta_tt_bus', 'beta_tt_metro', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_walking', 'beta_money']:
+                                    beta_2nd_der_dict[string2][string3]['pnr'][path_pnr_idx] = f_2nd_der_c * coef[string2] * coef[string3]
+                                for string2 in ['gamma_income_' + string1, 'gamma_Originpopden_' + string1, 'gamma_Destpopden_' + string1]:
+                                    gamma_2nd_der_dict[string2][string3][path_pnr_idx] = f_2nd_der_c * coef[string2] * coef[string3]
+                                for string2 in ['alpha_' + string1]:
+                                    alpha_2nd_der_dict[string2][string3][path_pnr_idx] = f_2nd_der_c * coef[string2] * coef[string3]
+        
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_tt_bus']['transit'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_tt_metro']['transit'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_tt_bus']['pnr'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_tt_metro']['pnr'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_walking']['transit'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_walking']['pnr'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_waiting_bus']['transit'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_waiting_bus']['pnr'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_waiting_metro']['transit'])
+        assert all(not np.isnan(arr).any() for arr in beta_der_dict['beta_waiting_metro']['pnr'])
+
+
+        return beta_der_dict, gamma_der_dict, alpha_der_dict, beta_2nd_der_dict, gamma_2nd_der_dict, alpha_2nd_der_dict
+                                        
+
+    def solve_DSUE(self, input_file_folder, q_e_traveler, nested_type, theta_dict, beta_dict, alpha_dict, gamma_dict, use_robust_tt, MSA_max_inter, MSA_step_size_gamma,
+                   MSA_step_size_Gamma, MSA_convergence_threshold, init_route_portion, use_file_as_init_and_first_inter, f_car_driving, f_transit, f_pnr, is_testing=False):
+        
+        if not use_file_as_init_and_first_inter:
+            with open(os.path.join(input_file_folder, 'dode_data.pickle'), 'rb') as f:
+                [_, _, _, _, _, _, _, od_mode_connectivity, _,_] = pickle.load(f)
+            if init_route_portion is None:
+                q_e_traveler = q_e_traveler.reshape((int(len(q_e_traveler) / self.num_assign_interval), self.num_assign_interval), order='F')
+                f_car_driving, f_transit, f_pnr = [], [], []
+                for idx, row in od_mode_connectivity.iterrows():
+                    O = row['OriginNodeID']
+                    D = row['DestNodeID']
+                    assigned_rate = 0
+                    if row['BusTransit'] == 1:
+                        for _ in range(len(self.nb.path_table_bustransit.path_dict[O][D].path_list)):
+                            f_transit.append(q_e_traveler[idx] * 0.4 / len(self.nb.path_table_bustransit.path_dict[O][D].path_list))
+                        assigned_rate += 0.4
+                    if row['PNR'] == 1:
+                        for _ in range(len(self.nb.path_table_pnr.path_dict[O][D].path_list)):
+                            f_pnr.append(q_e_traveler[idx] * 0.1 / len(self.nb.path_table_pnr.path_dict[O][D].path_list))
+                        assigned_rate += 0.1
+                    for _ in range(len(self.nb.path_table_driving.path_dict[O][D].path_list)):
+                        f_car_driving.append(q_e_traveler[idx] * (1 - assigned_rate) / len(self.nb.path_table_driving.path_dict[O][D].path_list))
+                f_car_driving = np.array(f_car_driving).flatten(order='F')
+                f_transit = np.array(f_transit).flatten(order='F')
+                f_pnr = np.array(f_pnr).flatten(order='F')
+                q_e_traveler = q_e_traveler.flatten(order='F')
+            else:
+                f_car_driving = init_route_portion['driving'].dot(q_e_traveler)
+                f_transit = init_route_portion['transit'].dot(q_e_traveler)
+                f_pnr = init_route_portion['pnr'].dot(q_e_traveler)
+        f_truck_driving = np.zeros((self.num_path_driving, self.num_assign_interval)).flatten(order='F')
+
+        k = 0
+        gap_list, f_car_driving_list, f_transit_list, f_pnr_list = [], [], [], []
+        f_car_driving_list.append(f_car_driving)
+        f_transit_list.append(f_transit)
+        f_pnr_list.append(f_pnr)
+        while k < MSA_max_inter:
+            OD_path_tt_list_driving, OD_path_alltts_list_transit, OD_path_alltts_list_pnr = self.compute_path_travel_waiting_walking_time(input_file_folder, f_car_driving, f_truck_driving, f_transit, f_pnr, use_robust_tt)
+            OD_path_cost_list_driving, OD_path_cost_list_transit, OD_path_cost_list_pnr = self.compute_path_cost_all(input_file_folder, OD_path_tt_list_driving, OD_path_alltts_list_transit, OD_path_alltts_list_pnr, beta_dict, alpha_dict, gamma_dict)
+            y_f_car_driving, y_f_transit, y_f_pnr, probs_record_dict = self.mode_route_choice_from_cost(input_file_folder, OD_path_cost_list_driving, OD_path_cost_list_transit, OD_path_cost_list_pnr, q_e_traveler, nested_type, theta_dict)
+            
+            assert not np.isnan(y_f_car_driving).any()
+            assert not np.isnan(y_f_transit).any()
+            assert not np.isnan(y_f_pnr).any()
+
+            gap = (np.linalg.norm(y_f_car_driving-f_car_driving) ** 2 + np.linalg.norm(y_f_transit-f_transit) ** 2 + np.linalg.norm(y_f_pnr-f_pnr) ** 2) / \
+                    (np.linalg.norm(f_car_driving) ** 2 + np.linalg.norm(f_transit) ** 2 + np.linalg.norm(f_pnr) ** 2)
+            if is_testing:
+                gap_list.append(gap)
+            if gap < MSA_convergence_threshold:
+                break
+            if k == 0:
+                MSA_beta = 1
+            elif np.linalg.norm(y_f_car_driving-f_car_driving) + np.linalg.norm(y_f_transit-f_transit) + np.linalg.norm(y_f_pnr-f_pnr) >= \
+                    np.linalg.norm(y_f_car_driving_old-f_car_driving_old) + np.linalg.norm(y_f_transit_old-f_transit_old) + np.linalg.norm(y_f_pnr_old-f_pnr_old):
+                MSA_beta = MSA_beta_old + MSA_step_size_Gamma
+            else:
+                MSA_beta = MSA_beta_old + MSA_step_size_gamma
+            
+            f_car_driving_old = f_car_driving
+            f_transit_old = f_transit
+            f_pnr_old = f_pnr
+            MSA_beta_old = MSA_beta
+            y_f_car_driving_old = y_f_car_driving
+            y_f_transit_old = y_f_transit
+            y_f_pnr_old = y_f_pnr
+        
+            f_car_driving = f_car_driving_old + (1/MSA_beta) * (y_f_car_driving - f_car_driving_old)
+            f_transit = f_transit_old + (1/MSA_beta) * (y_f_transit - f_transit_old)
+            f_pnr = f_pnr_old + (1/MSA_beta) * (y_f_pnr - f_pnr_old)
+
+            if is_testing:
+                f_car_driving_list.append(f_car_driving)
+                f_transit_list.append(f_transit)
+                f_pnr_list.append(f_pnr)
+
+            k += 1
+
+        if is_testing:
+            return gap_list, f_car_driving_list, f_transit_list, f_pnr_list
+        
+        # k_probs_driving = probs_record_dict['k_probs_driving']
+        # k_probs_transit = probs_record_dict['k_probs_transit']
+        # k_probs_pnr = probs_record_dict['k_probs_pnr']
+        # gm_probs_driving = probs_record_dict['gm_probs_driving']
+        # gm_probs_transit = probs_record_dict['gm_probs_transit']
+        # gm_probs_pnr = probs_record_dict['gm_probs_pnr']
+        # m_probs_driving = probs_record_dict['m_probs_driving']
+        # m_probs_transit = probs_record_dict['m_probs_transit']
+        # m_probs_pnr = probs_record_dict['m_probs_pnr']
+        # assert all(not np.isnan(arr).any() for arr in k_probs_driving)
+        # assert all(not np.isnan(arr).any() for arr in k_probs_transit)
+        # assert all(not np.isnan(arr).any() for arr in k_probs_pnr)
+        # assert all(not np.isnan(arr).any() for arr in gm_probs_driving)
+        # assert all(not np.isnan(arr).any() for arr in gm_probs_transit)
+        # assert all(not np.isnan(arr).any() for arr in gm_probs_pnr)
+        # assert all(not np.isnan(arr).any() for arr in m_probs_driving)
+        # assert all(not np.isnan(arr).any() for arr in m_probs_transit)
+        # assert all(not np.isnan(arr).any() for arr in m_probs_pnr)
+        
+        #********************for testing purpose only********************
+        # if 'probs_record_dict' not in locals():
+        #     probs_record_dict = None
+        #     OD_path_tt_list_driving  = None
+        #     OD_path_alltts_list_transit = None
+        #     OD_path_alltts_list_pnr = None
+        #     gap = None
+        #*********************************************************************
+
+        # compute the derivatives of disutility parameters. Note: if not achieving DSUE, the derivatives are not (cannot be) accurate
+        beta_der_dict, gamma_der_dict, alpha_der_dict, beta_2nd_der_dict, gamma_2nd_der_dict, alpha_2nd_der_dict \
+              = self.compute_para_derivatives(input_file_folder, q_e_traveler, nested_type, theta_dict, OD_path_tt_list_driving, OD_path_alltts_list_transit, OD_path_alltts_list_pnr,
+                                 probs_record_dict)
+        assert not np.isnan(f_car_driving).any()
+        assert not np.isnan(f_transit).any()
+        assert not np.isnan(f_pnr).any()
+
+        
+        return f_car_driving, f_transit, f_pnr, beta_der_dict, gamma_der_dict, alpha_der_dict, k, gap, beta_2nd_der_dict, gamma_2nd_der_dict, alpha_2nd_der_dict
+
+
+    def estimate_JointDemandDisutility(self, init_q_e_traveler_scale = 5, init_q_e_traveler = None,
+                                    traveler_step_size = 0.1, truck_step_size=0.01, 
+                                    gamma_truck = 0.9, gamma_traveler = 0.9, gamma_disutility_paras = 0.9,
+                                    link_car_flow_weight=1, link_truck_flow_weight=1, link_passenger_flow_weight=1, link_bus_flow_weight=1,
+                                    link_car_tt_weight=1, link_truck_tt_weight=1, link_passenger_tt_weight=1, link_bus_tt_weight=1, ODloss_weight=1,
+                                    max_epoch=100, algo="NAdam", explicit_bus=1, 
+                                    use_file_as_init=None, save_folder=None, starting_epoch=0, random_init=True,
+                                    q_e_traveler_in_loss = None, q_truck_in_loss = None,
+                                    input_file_folder=None, nested_type =1, theta_dict=None, beta_dict=None, alpha_dict=None, gamma_dict=None, # if estimate disutility paras, these will be initial values
+                                    use_robust_tt=True, MSA_max_inter=10, MSA_step_size_gamma=0.2, MSA_step_size_Gamma=1.1, MSA_convergence_threshold=0.0001,
+                                    beta_step_size=0.1, alpha_step_size=0.1, gamma_step_size=0.1, removed_para_idx=None):
+        
+        if save_folder is not None and not os.path.exists(save_folder):
+            os.mkdir(save_folder)
+
+        if np.isscalar(link_car_flow_weight):
+            link_car_flow_weight = np.ones(max_epoch, dtype=bool) * link_car_flow_weight
+        assert(len(link_car_flow_weight) == max_epoch)
+
+        if np.isscalar(link_truck_flow_weight):
+            link_truck_flow_weight = np.ones(max_epoch, dtype=bool) * link_truck_flow_weight
+        assert(len(link_truck_flow_weight) == max_epoch)
+
+        if np.isscalar(link_passenger_flow_weight):
+            link_passenger_flow_weight = np.ones(max_epoch, dtype=bool) * link_passenger_flow_weight
+        assert(len(link_passenger_flow_weight) == max_epoch)
+
+        if np.isscalar(link_bus_flow_weight):
+            link_bus_flow_weight = np.ones(max_epoch, dtype=bool) * link_bus_flow_weight
+        assert(len(link_bus_flow_weight) == max_epoch)
+
+        if np.isscalar(link_car_tt_weight):
+            link_car_tt_weight = np.ones(max_epoch, dtype=bool) * link_car_tt_weight
+        assert(len(link_car_tt_weight) == max_epoch)
+
+        if np.isscalar(link_truck_tt_weight):
+            link_truck_tt_weight = np.ones(max_epoch, dtype=bool) * link_truck_tt_weight
+        assert(len(link_truck_tt_weight) == max_epoch)
+
+        if np.isscalar(link_passenger_tt_weight):
+            link_passenger_tt_weight = np.ones(max_epoch, dtype=bool) * link_passenger_tt_weight
+        assert(len(link_passenger_tt_weight) == max_epoch)
+
+        if np.isscalar(link_bus_tt_weight):
+            link_bus_tt_weight = np.ones(max_epoch, dtype=bool) * link_bus_tt_weight
+        assert(len(link_bus_tt_weight) == max_epoch)
+        
+        loss_list = list()
+        DSUE_k_list, DSUE_gap_list = list(), list()
+        best_epoch = starting_epoch
+        best_q_e_truck = 0
+        best_q_e_traveler = 0
+        best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus = 0, 0, 0, 0, 0, 0, 0, 0
+        # read from files as init values
+        if use_file_as_init is not None:
+            # most recent
+            _, _, loss_list, best_epoch,\
+                _, _, \
+                _, _, _, _, \
+                _, _, _ , _, _, _, _, _, \
+                _, _, _, DSUE_k_list, DSUE_gap_list, _ ,_, _ = pickle.load(open(use_file_as_init, 'rb'))
+            # best
+            use_file_as_init = os.path.join(save_folder, '{}_iteration_estimate_demand.pickle'.format(best_epoch))
+            _, _, _, _, best_q_e_traveler, best_q_e_truck, \
+                best_f_car_driving, best_f_truck_driving, best_f_transit, best_f_pnr, \
+                best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus, \
+                best_beta_dict, best_gamma_dict, best_alpha_dict, _ ,_ , _ , _, _= pickle.load(open(use_file_as_init, 'rb'))
+
+            q_e_truck = best_q_e_truck
+            q_e_traveler = best_q_e_traveler
+            f_car_driving, f_truck_driving, f_transit, f_pnr = best_f_car_driving, best_f_truck_driving, best_f_transit, best_f_pnr
+            beta_dict, gamma_dict, alpha_dict = best_beta_dict, best_gamma_dict, best_alpha_dict
+            
+            # update demand and route portions according to the path flow (maybe not necessary, since in solve_DSUE, we will update the demand based on path flow again)
+            self.nb.update_demand_path_driving(f_car_driving, f_truck_driving)
+            self.nb.update_demand_path_bustransit(f_transit)
+            self.nb.update_demand_path_pnr(f_pnr)
+            self.nb.get_mode_portion_matrix() # update total demand
+                
+        else:
+            if random_init: # for demand only, init_values parameters of disutility functions are always from the input of this function if not using file as init
+                # q_e: num_OD x num_assign_interval flattened in F order
+                q_e_traveler = self.init_demand_flow(len(self.demand_list_total_passenger), init_scale=init_q_e_traveler_scale)
+                q_e_truck = self.init_demand_flow(len(self.demand_list_truck_driving), init_scale=0)
+                # uniform
+                self.init_mode_route_portions()
+                f_car_driving, f_transit, f_pnr = None, None, None # this is because these are part of input in solve_DSUE if use_file_as_init is True and if the 1st iteration, 
+                # will not be used actually but we need to have these variables
+                f_truck_driving = np.zeros((self.num_path_driving, self.num_assign_interval)).flatten(order='F') # if estimate truck, make sure this is consistent with q_e_truck, route portion will be fixed
+            else: # use input files as init -  demand and route portions are already initialized in the network builder
+                # note: it will use the by_mode demand from the input files: need to make sure the summation of by_mode demand is consistent with the init total demand in the input (init_q_e_traveler)
+                # the specific mode split in the input files will not be used since in the solve_DSUE process later, it has an inherent mode split setting
+                # Note: if we want to use a specific mode split pattern as init, define it well in the input files, and modify the setting in the solve_DSUE function (simply
+                #  change the the calculation of init path flows, get them from the inintalized network builder)
+                q_e_traveler = init_q_e_traveler
+                self.nb.get_mode_portion_matrix() # make the total demand consistent
+                q_e_truck = self.init_demand_flow(len(self.demand_list_truck_driving), init_scale=0)
+                f_car_driving, f_transit, f_pnr = None, None, None
+                f_truck_driving = np.zeros((self.num_path_driving, self.num_assign_interval)).flatten(order='F') # if estimate truck, make sure this is consistent with q_e_truck, route portion will be fixed
+                # if want the route portion of truck to be from input files, here use: _, P_path_truck_driving = self.nb.get_route_portion_matrix_driving(); f_truck_driving = P_path_truck_driving.dot(q_e_truck)
+            
+                
+        # relu
+        q_e_truck = np.maximum(q_e_truck, 1e-6)
+        q_e_traveler = np.maximum(q_e_traveler, 1e-6)
+        beta_array, gamma_array, alpha_array = swap_dict_and_array(beta_dict, gamma_dict, alpha_dict)
+        beta_array, gamma_array, alpha_array = np.maximum(beta_array, 1e-6), np.maximum(gamma_array, 1e-6), np.maximum(alpha_array, 1e-6)
+        if removed_para_idx is not None:
+            beta_array[removed_para_idx['beta']] = 0
+            gamma_array[removed_para_idx['gamma']] = 0
+            alpha_array[removed_para_idx['alpha']] = 0
+
+        # q_e_truck_tensor = torch.from_numpy(q_e_truck)
+        q_e_traveler_tensor = torch.from_numpy(q_e_traveler)
+        beta_tensor, gamma_tensor, alpha_tensor = torch.from_numpy(beta_array), torch.from_numpy(gamma_array), torch.from_numpy(alpha_array)
+
+        # q_e_truck_tensor.requires_grad = True
+        q_e_traveler_tensor.requires_grad = True
+        beta_tensor.requires_grad, gamma_tensor.requires_grad, alpha_tensor.requires_grad = True, True, True
+
+        algo_dict = {
+            "SGD": torch.optim.SGD,
+            "NAdam": torch.optim.NAdam,
+            "Adam": torch.optim.Adam,
+            "Adamax": torch.optim.Adamax,
+            "AdamW": torch.optim.AdamW,
+            "RAdam": torch.optim.RAdam,
+            "Adagrad": torch.optim.Adagrad,
+            "Adadelta": torch.optim.Adadelta
+        }
+
+        optimizers = [
+        algo_dict[algo]([{'params': q_e_traveler_tensor}], lr=traveler_step_size),
+        algo_dict[algo]([{'params': beta_tensor, 'lr': beta_step_size}, {'params': gamma_tensor, 'lr': gamma_step_size}, {'params': alpha_tensor, 'lr': alpha_step_size}]),
+        # algo_dict[algo]([{'params': q_e_truck_tensor}], lr=truck_step_size)
+        ]
+
+        schedulers = [
+            torch.optim.lr_scheduler.ExponentialLR(optimizers[0], gamma=gamma_traveler),
+            torch.optim.lr_scheduler.ExponentialLR(optimizers[1], gamma=gamma_disutility_paras),
+            # torch.optim.lr_scheduler.ExponentialLR(optimizers[2], gamma=gamma_truck)
+        ]
+
+
+        for i in range(max_epoch):
+            seq = np.random.permutation(self.num_data)
+            loss = float(0)
+            loss_dict = {
+                "car_count_loss": 0.,
+                "truck_count_loss": 0.,
+                "bus_count_loss": 0.,
+                "passenger_count_loss": 0.,
+                "car_tt_loss": 0.,
+                "truck_tt_loss": 0.,
+                "bus_tt_loss": 0.,
+                "passenger_tt_loss": 0.,
+                "car_count_loss_weighted": 0.,
+                "truck_count_loss_weighted": 0.,
+                "bus_count_loss_weighted": 0.,
+                "passenger_count_loss_weighted": 0.,
+                "car_tt_loss_weighted": 0.,
+                "truck_tt_loss_weighted": 0.,
+                "bus_tt_loss_weighted": 0.,
+                "passenger_tt_loss_weighted": 0.,
+                "total_loss_weighted": 0.
+            }
+
+            self.config['link_car_flow_weight'] = link_car_flow_weight[i] * (self.config['use_car_link_flow'] or self.config['compute_car_link_flow_loss'])
+            self.config['link_truck_flow_weight'] = link_truck_flow_weight[i] * (self.config['use_truck_link_flow'] or self.config['compute_truck_link_flow_loss'])
+            self.config['link_passenger_flow_weight'] = link_passenger_flow_weight[i] * (self.config['use_passenger_link_flow'] or self.config['compute_passenger_link_flow_loss'])
+            self.config['link_bus_flow_weight'] = link_bus_flow_weight[i] * (self.config['use_bus_link_flow'] or self.config['compute_bus_link_flow_loss'])
+
+            self.config['link_car_tt_weight'] = link_car_tt_weight[i] * (self.config['use_car_link_tt'] or self.config['compute_car_link_tt_loss'])
+            self.config['link_truck_tt_weight'] = link_truck_tt_weight[i] * (self.config['use_truck_link_tt'] or self.config['compute_truck_link_tt_loss'])
+            self.config['link_passenger_tt_weight'] = link_passenger_tt_weight[i] * (self.config['use_passenger_link_tt'] or self.config['compute_passenger_link_tt_loss'])
+            self.config['link_bus_tt_weight'] = link_bus_tt_weight[i] * (self.config['use_bus_link_tt'] or self.config['compute_bus_link_tt_loss'])
+            
+
+            for j in seq:  # TODO: not update for each data record: update after all data records
+                # retrieve one record of observed data
+                one_data_dict = self._get_one_data(j)
+
+                # forward, get path flow with q_e_traveler
+                if i == 0 and not use_file_as_init: 
+                    init_route_portion = None
+                if use_file_as_init and i == 0:
+                    use_file_as_init_and_first_inter = True
+                else:
+                    use_file_as_init_and_first_inter = False
+                f_car_driving, f_transit, f_pnr, beta_der_dict, gamma_der_dict, alpha_der_dict, k, gap, beta_2nd_der_dict, gamma_2nd_der_dict, alpha_2nd_der_dict\
+                      = self.solve_DSUE(input_file_folder, q_e_traveler, nested_type, theta_dict, beta_dict, alpha_dict, 
+                                                                  gamma_dict, use_robust_tt, MSA_max_inter, MSA_step_size_gamma,
+                                                                    MSA_step_size_Gamma, MSA_convergence_threshold, init_route_portion, use_file_as_init_and_first_inter,
+                                                                    f_car_driving, f_transit, f_pnr)
+                
+                # if 'P_path_truck_driving' in locals():
+                #     f_truck_driving = P_path_truck_driving.dot(q_e_truck) # assume truck route portion is fixed
+
+                # Note: below for solving the mode/route portion matrices, follow the previous code and logic for ease, 
+                # theorectically equivalent to our case where we estimate total demand and have nested mode such as metro, etc..
+
+                # update demand and route portions according to the new path flow, for computing mode/route portion matrices
+                self.nb.update_demand_path_driving(f_car_driving, f_truck_driving)
+                self.nb.update_demand_path_bustransit(f_transit)
+                self.nb.update_demand_path_pnr(f_pnr)
+
+                # P_mode: (num_OD_one_mode * num_assign_interval, num_OD * num_assign_interval)
+                P_mode_driving, P_mode_transit, P_mode_pnr = self.nb.get_mode_portion_matrix() # also at the same time update total demand
+
+                # P_path: (num_path * num_assign_interval, num_OD_one_mode * num_assign_interval)
+                P_path_car_driving, P_path_truck_driving = self.nb.get_route_portion_matrix_driving()
+                P_path_passenger_transit = self.nb.get_route_portion_matrix_bustransit()
+                P_path_pnr = self.nb.get_route_portion_matrix_pnr()
+                
+                # init_route_portion = None
+                init_route_portion = dict()
+                init_route_portion['driving'] = P_path_car_driving.dot(P_mode_driving)
+                init_route_portion['transit'] = P_path_passenger_transit.dot(P_mode_transit)
+                init_route_portion['pnr'] = P_path_pnr.dot(P_mode_pnr)
+
+                f_car_driving = np.maximum(f_car_driving, 1e-3 / self.nb.config.config_dict['DTA']['flow_scalar'])
+                # f_truck_driving = np.maximum(f_truck_driving, 1e-3 / self.nb.config.config_dict['DTA']['flow_scalar'])
+                # this alleviate trapping in local minima, when f = 0 -> grad = 0 is not helping
+                f_transit = np.maximum(f_transit, 1e-3 / self.nb.config.config_dict['DTA']['flow_scalar'])
+                f_pnr = np.maximum(f_pnr, 1e-3 / self.nb.config.config_dict['DTA']['flow_scalar'])
+                
+                if loss_list:
+                    init_loss = loss_list[0][1]
+                else:
+                    init_loss = None
+                # f_grad: num_path * num_assign_interval
+                # f_car_driving_grad, f_truck_driving_grad, f_passenger_transit_grad, f_car_pnr_grad, f_passenger_pnr_grad, _, \
+                #     tmp_loss, tmp_loss_dict, _, x_e_car, x_e_truck, x_e_passenger, x_e_bus, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus = \
+                f_car_driving_grad, f_truck_driving_grad, f_passenger_bustransit_grad, f_car_pnr_grad, f_passenger_pnr_grad, _, \
+                    tmp_loss, tmp_loss_dict, _, x_e_car, x_e_truck, x_e_passenger, x_e_bus, x_e_BoardingAlighting_count, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus,\
+                        f_transit_ULP, stop_arrival_departure_travel_time_df, Jacobian_dict = \
+                        self.compute_path_flow_grad_and_loss(one_data_dict, f_car_driving, f_truck_driving, f_transit, f_pnr, f_bus=None, 
+                        fix_bus=True, counter=0, run_mmdta_adaptive=False, init_loss = init_loss, explicit_bus=explicit_bus, isUsingbymode = False)
+                assert not np.isnan(f_car_driving_grad).any()
+                assert not np.isnan(f_passenger_transit_grad).any()
+                assert not np.isnan(f_car_pnr_grad).any()
+                assert not np.isnan(f_passenger_pnr_grad).any()
+                
+                # q_mode_grad: num_OD_one_mode * num_assign_interval
+                q_grad_car_driving = P_path_car_driving.T.dot(f_car_driving_grad)  # link_car_flow_weight, link_car_tt_weight
+                q_grad_car_pnr = P_path_pnr.T.dot(f_car_pnr_grad)  # link_car_flow_weight, link_car_tt_weight
+                # q_truck_grad = P_path_truck_driving.T.dot(f_truck_driving_grad)  # link_truck_flow_weight, link_truck_tt_weight, link_bus_tt_weight
+                q_grad_passenger_transit = P_path_passenger_transit.T.dot(f_passenger_transit_grad)  # link_passenger_flow_weight, link_bus_tt_weight
+                q_grad_passenger_pnr = P_path_pnr.T.dot(f_passenger_pnr_grad)  # link_passenger_flow_weight, link_bus_tt_weight
+
+                # q_grad: num_OD * num_assign_interval
+                q_traveler_grad = P_mode_driving.T.dot(q_grad_car_driving) \
+                                   + P_mode_transit.T.dot(q_grad_passenger_transit) \
+                                   + P_mode_pnr.T.dot(q_grad_passenger_pnr + q_grad_car_pnr)
+                
+                assert not np.isnan(q_traveler_grad).any()
+                assert not np.isnan(q_grad_car_driving).any()
+                assert not np.isnan(q_grad_car_pnr).any()
+                assert not np.isnan(q_grad_passenger_transit).any()
+                assert not np.isnan(q_grad_passenger_pnr).any()
+
+                # use OD loss or not
+                eps = 1e-8
+                if self.config['use_OD_loss']:
+                    q_traveler_grad += (q_e_traveler - q_e_traveler_in_loss) / (np.linalg.norm(q_e_traveler - q_e_traveler_in_loss) + eps) * ODloss_weight
+                    # q_truck_grad += (q_e_truck - q_truck_in_loss) / (np.linalg.norm(q_e_truck - q_truck_in_loss) + eps) * ODloss_weight
+
+                # grads for disutility parameters
+                beta_grad, gamma_grad, alpha_grad = dict(), dict(), dict()
+                beta_2nd_grad, gamma_2nd_grad, alpha_2nd_grad = dict(), dict(), dict()
+                for key in beta_dict.keys():
+                    if key == 'beta_tt_car':
+                        beta_grad[key] = np.dot(beta_der_dict[key]['driving'].flatten(order='F'), f_car_driving_grad) + \
+                                        np.dot(beta_der_dict[key]['pnr'].flatten(order='F'), f_car_pnr_grad) + \
+                                        np.dot(beta_der_dict[key]['pnr'].flatten(order='F'), f_passenger_pnr_grad)
+                        beta_2nd_grad[key] = dict()
+                        for k in beta_2nd_der_dict[key].keys():
+                            beta_2nd_grad[key][k] = np.dot(beta_2nd_der_dict[key][k]['driving'].flatten(order='F'), f_car_driving_grad) + \
+                                        np.dot(beta_2nd_der_dict[key][k]['pnr'].flatten(order='F'), f_car_pnr_grad) + \
+                                        np.dot(beta_2nd_der_dict[key][k]['pnr'].flatten(order='F'), f_passenger_pnr_grad)
+                    elif key == 'beta_money':
+                        beta_grad[key] = np.dot(beta_der_dict[key]['driving'].flatten(order='F'), f_car_driving_grad) + \
+                                        np.dot(beta_der_dict[key]['pnr'].flatten(order='F'), f_car_pnr_grad) + \
+                                        np.dot(beta_der_dict[key]['pnr'].flatten(order='F'), f_passenger_pnr_grad) + np.dot(beta_der_dict[key]['transit'].flatten(order='F'), \
+                                                                                                                            f_passenger_transit_grad)
+                        beta_2nd_grad[key] = dict()
+                        for k in beta_2nd_der_dict[key].keys():
+                            beta_2nd_grad[key][k] = np.dot(beta_2nd_der_dict[key][k]['driving'].flatten(order='F'), f_car_driving_grad) + \
+                                        np.dot(beta_2nd_der_dict[key][k]['pnr'].flatten(order='F'), f_car_pnr_grad) + \
+                                        np.dot(beta_2nd_der_dict[key][k]['pnr'].flatten(order='F'), f_passenger_pnr_grad) + np.dot(beta_2nd_der_dict[key][k]['transit'].flatten(order='F'), \
+                                                                                                                            f_passenger_transit_grad)
+                    else:
+                        beta_grad[key] = np.dot(beta_der_dict[key]['transit'].flatten(order='F'), f_passenger_transit_grad) + \
+                                        np.dot(beta_der_dict[key]['pnr'].flatten(order='F'), f_passenger_pnr_grad) + \
+                                        np.dot(beta_der_dict[key]['pnr'].flatten(order='F'), f_car_pnr_grad)
+                        beta_2nd_grad[key] = dict()
+                        for k in beta_2nd_der_dict[key].keys():
+                            beta_2nd_grad[key][k] = np.dot(beta_2nd_der_dict[key][k]['transit'].flatten(order='F'), f_passenger_transit_grad) + \
+                                        np.dot(beta_2nd_der_dict[key][k]['pnr'].flatten(order='F'), f_passenger_pnr_grad) + \
+                                        np.dot(beta_2nd_der_dict[key][k]['pnr'].flatten(order='F'), f_car_pnr_grad)
+                        if np.isnan(beta_grad[key]).any():
+                            print(f"NaN detected in beta_grad[{key}]")
+                            pickle.dump([beta_grad,beta_der_dict,f_passenger_transit_grad,f_passenger_pnr_grad,f_car_pnr_grad], open(os.path.join(save_folder, 'errors.pickle'), 'wb'))
+                            raise ValueError(f"NaN detected in beta_grad[{key}]")
+                for string1 in ['income', 'Originpopden', 'Destpopden']:
+                    gamma_grad['gamma_' + string1 + '_car'] = np.dot(gamma_der_dict['gamma_' + string1 + '_car'].flatten(order='F'), f_car_driving_grad)
+                    gamma_2nd_grad['gamma_' + string1 + '_car'] = dict()
+                    for k in gamma_2nd_der_dict['gamma_' + string1 + '_car'].keys():
+                        gamma_2nd_grad['gamma_' + string1 + '_car'][k] = np.dot(gamma_2nd_der_dict['gamma_' + string1 + '_car'][k].flatten(order='F'), f_car_driving_grad)
+                    for string2 in ['bus', 'metro', 'busmetro']:
+                        gamma_grad['gamma_' + string1 + '_' + string2] = np.dot(gamma_der_dict['gamma_' + string1 + '_' + string2].flatten(order='F'), f_passenger_transit_grad)
+                        gamma_2nd_grad['gamma_' + string1 + '_' + string2] = dict()
+                        for k in gamma_2nd_der_dict['gamma_' + string1 + '_' + string2].keys():
+                            gamma_2nd_grad['gamma_' + string1 + '_' + string2][k] = np.dot(gamma_2nd_der_dict['gamma_' + string1 + '_' + string2][k].flatten(order='F'), f_passenger_transit_grad)
+                    for string2 in ['carbus', 'carmetro', 'carbusmetro']:
+                        gamma_grad['gamma_' + string1 + '_' + string2] = np.dot(gamma_der_dict['gamma_' + string1 + '_' + string2].flatten(order='F'), f_car_pnr_grad) + \
+                                        np.dot(gamma_der_dict['gamma_' + string1 + '_' + string2].flatten(order='F'), f_passenger_pnr_grad)
+                        gamma_2nd_grad['gamma_' + string1 + '_' + string2] = dict()
+                        for k in gamma_2nd_der_dict['gamma_' + string1 + '_' + string2].keys():
+                            gamma_2nd_grad['gamma_' + string1 + '_' + string2][k] = np.dot(gamma_2nd_der_dict['gamma_' + string1 + '_' + string2][k].flatten(order='F'), f_car_pnr_grad) + \
+                                        np.dot(gamma_2nd_der_dict['gamma_' + string1 + '_' + string2][k].flatten(order='F'), f_passenger_pnr_grad)
+                for string1 in ['bus', 'metro', 'busmetro']:
+                    alpha_grad['alpha_' + string1] = np.dot(alpha_der_dict['alpha_' + string1].flatten(order='F'), f_passenger_transit_grad)
+                    alpha_2nd_grad['alpha_' + string1] = dict()
+                    for k in alpha_2nd_der_dict['alpha_' + string1].keys():
+                        alpha_2nd_grad['alpha_' + string1][k] = np.dot(alpha_2nd_der_dict['alpha_' + string1][k].flatten(order='F'), f_passenger_transit_grad)
+                for string1 in ['carbus', 'carmetro', 'carbusmetro']:
+                    alpha_grad['alpha_' + string1] = np.dot(alpha_der_dict['alpha_' + string1].flatten(order='F'), f_car_pnr_grad) + \
+                                        np.dot(alpha_der_dict['alpha_' + string1].flatten(order='F'), f_passenger_pnr_grad)
+                    alpha_2nd_grad['alpha_' + string1] = dict()
+                    for k in alpha_2nd_der_dict['alpha_' + string1].keys():
+                        alpha_2nd_grad['alpha_' + string1][k] = np.dot(alpha_2nd_der_dict['alpha_' + string1][k].flatten(order='F'), f_car_pnr_grad) + \
+                                        np.dot(alpha_2nd_der_dict['alpha_' + string1][k].flatten(order='F'), f_passenger_pnr_grad)
+                
+                
+                assert not np.isnan(beta_der_dict['beta_tt_bus']['transit']).any()
+                assert not np.isnan(beta_der_dict['beta_tt_bus']['pnr']).any()
+                assert not np.isnan(beta_der_dict['beta_tt_metro']['transit']).any()
+                assert not np.isnan(beta_der_dict['beta_tt_metro']['pnr']).any()
+                assert not np.isnan(beta_der_dict['beta_walking']['transit']).any()
+                assert not np.isnan(beta_der_dict['beta_walking']['pnr']).any()
+                assert not np.isnan(beta_der_dict['beta_waiting_bus']['transit']).any()
+                assert not np.isnan(beta_der_dict['beta_waiting_bus']['pnr']).any()
+                assert not np.isnan(beta_der_dict['beta_waiting_metro']['transit']).any()
+                assert not np.isnan(beta_der_dict['beta_waiting_metro']['pnr']).any()
+                for key, arr in beta_grad.items():
+                    assert not np.isnan(arr).any(), f"NaN detected in array at key: {key}"
+                
+                beta_grad, gamma_grad, alpha_grad = swap_dict_and_array(beta_grad, gamma_grad, alpha_grad)
+                assert not np.isnan(beta_grad).any()
+                assert not np.isnan(gamma_grad).any()
+                assert not np.isnan(alpha_grad).any()
+
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
+
+                q_e_traveler_tensor.grad = torch.from_numpy(q_traveler_grad)
+                # q_e_truck_tensor.grad = torch.from_numpy(q_truck_grad)
+                beta_tensor.grad, gamma_tensor.grad, alpha_tensor.grad = torch.from_numpy(beta_grad), torch.from_numpy(gamma_grad), torch.from_numpy(alpha_grad)
+                
+                for optimizer in optimizers:
+                    optimizer.step()
+                for scheduler in schedulers:
+                    scheduler.step()
+
+                # release memory
+                f_car_driving_grad, f_truck_driving_grad, f_passenger_transit_grad, f_car_pnr_grad, f_passenger_pnr_grad = 0, 0, 0, 0, 0
+                q_grad_car_driving, q_grad_car_pnr, q_truck_grad, q_grad_passenger_transit, q_grad_passenger_pnr, q_traveler_grad = 0, 0, 0, 0, 0, 0
+                beta_grad, gamma_grad, alpha_grad = 0, 0, 0
+                beta_der_dict, gamma_der_dict, alpha_der_dict = 0, 0, 0
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
+
+                q_e_traveler = q_e_traveler_tensor.data.cpu().numpy()
+                # q_e_truck = q_e_truck_tensor.data.cpu().numpy()
+                beta_array, gamma_array, alpha_array = beta_tensor.data.cpu().numpy(), gamma_tensor.data.cpu().numpy(), alpha_tensor.data.cpu().numpy()
+                
+
+                # relu
+                q_e_traveler = np.maximum(q_e_traveler, 1e-6)
+                q_e_truck = np.maximum(q_e_truck, 1e-6)
+                beta_array, gamma_array, alpha_array = np.maximum(beta_array, 1e-6), np.maximum(gamma_array, 1e-6), np.maximum(alpha_array, 1e-6)
+                if removed_para_idx is not None:
+                    beta_array[removed_para_idx['beta']] = 0
+                    gamma_array[removed_para_idx['gamma']] = 0
+                    alpha_array[removed_para_idx['alpha']] = 0
+                beta_dict, gamma_dict, alpha_dict = swap_dict_and_array(beta_array, gamma_array, alpha_array)
+
+                loss += tmp_loss / float(self.num_data)
+                for loss_type, loss_value in tmp_loss_dict.items():
+                    loss_dict[loss_type] += loss_value / float(self.num_data)
+
+                #  temporary not in use, since we do not need to compute path cost later on from macposts c++
+                # if not self.config['use_car_link_tt'] and not self.config['use_truck_link_tt'] and not self.config['use_passenger_link_tt'] and not self.config['use_bus_link_tt']:
+                #     # if any of these is true, dta.build_link_cost_map(True) is already invoked in compute_path_flow_grad_and_loss()
+                #     dta.build_link_cost_map(False)
+
+            print("Epoch:", starting_epoch + i, "Loss:", loss, self.print_separate_accuracy(loss_dict))
+            loss_list.append([loss, loss_dict]) # xm: if use_file_as_init, wouldn't this be starting overwriting from the best_epoch?
+
+            DSUE_k_list.append(k)
+            DSUE_gap_list.append(gap)
+
+            if (best_epoch == 0) or (loss_list[best_epoch][0] > loss_list[-1][0]):
+                best_epoch = starting_epoch + i
+                best_f_car_driving, best_f_truck_driving, best_f_transit, best_f_pnr, best_q_e_truck, best_q_e_traveler = \
+                    f_car_driving, f_truck_driving, f_transit, f_pnr, q_e_truck, q_e_traveler
+
+                best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus = \
+                    x_e_car, x_e_truck, x_e_passenger, x_e_bus, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus
+                
+                best_beta_dict, best_gamma_dict, best_alpha_dict = beta_dict, gamma_dict, alpha_dict
+
+                best_DSUE_k, best_DSUE_gap = k, gap
+
+                if save_folder is not None:
+                    self.save_simulation_input_files(os.path.join(save_folder, 'input_files_estimate_demand'), 
+                                                     f_car_driving, f_truck_driving, f_transit, f_pnr, f_bus=None,
+                                                     explicit_bus=explicit_bus, historical_bus_waiting_time=0)
+
+            if save_folder is not None:
+                pickle.dump([loss, loss_dict, loss_list, best_epoch,
+                             q_e_traveler, q_e_truck, 
+                             f_car_driving, f_truck_driving, f_transit, f_pnr,
+                             x_e_car, x_e_truck, x_e_passenger, x_e_bus, tt_e_car, tt_e_truck, tt_e_passenger, tt_e_bus,
+                             beta_dict, gamma_dict, alpha_dict, DSUE_k_list, DSUE_gap_list, beta_2nd_grad, gamma_2nd_grad, alpha_2nd_grad], 
+                            open(os.path.join(save_folder, str(starting_epoch + i) + '_iteration_estimate_demand.pickle'), 'wb'))
+        
+        print("Best loss at Epoch:", best_epoch, "Loss:", loss_list[best_epoch][0], self.print_separate_accuracy(loss_list[best_epoch][1]))
+        return best_f_car_driving, best_f_truck_driving, best_f_transit, best_f_pnr, best_q_e_traveler, best_q_e_truck, \
+                best_x_e_car, best_x_e_truck, best_x_e_passenger, best_x_e_bus, best_tt_e_car, best_tt_e_truck, best_tt_e_passenger, best_tt_e_bus, \
+                best_beta_dict, best_gamma_dict, best_alpha_dict, best_DSUE_k, best_DSUE_gap, DSUE_k_list, DSUE_gap_list, loss_list, beta_2nd_grad, gamma_2nd_grad, alpha_2nd_grad
 
 
     def estimate_demand(self, init_scale_passenger=10, init_scale_truck=10, init_scale_bus=1,
@@ -4266,24 +6491,27 @@ def logit_fn(cost, alpha, beta, max_cut=True):
 
 class PostProcessing:
     def __init__(self, dode, dta=None, 
-                 estimated_car_count=None, estimated_truck_count=None, estimated_passenger_count=None, estimated_bus_count=None,
-                 estimated_car_cost=None, estimated_truck_cost=None, estimated_passenger_cost=None, estimated_bus_cost=None,
+                 estimated_car_count=None, estimated_truck_count=None, estimated_passenger_count=None, estimated_bus_count=None, estimated_BoardingAlighting_count=None,
+                 estimated_car_cost=None, estimated_truck_cost=None, estimated_passenger_cost=None, estimated_bus_cost=None, 
+                 estimated_stop_arrival_departure_travel_time_df = None,
                  result_folder=None):
         self.dode = dode
         self.dta = dta
         self.result_folder = result_folder
         self.one_data_dict = None
 
-        self.color_list = ['teal', 'tomato', 'blue', 'sienna', 'plum', 'red', 'yellowgreen', 'khaki']
+        self.color_list = ['teal', 'tomato', 'blue', 'sienna', 'plum', 'red', 'yellowgreen', 'khaki', 'lightpink']
         self.marker_list = ["o", "v", "^", "<", ">", "p", "D", "*", "s", "D", "p"]
 
-        self.r2_car_count, self.r2_truck_count, self.r2_passenger_count, self.r2_bus_count = "NA", "NA", "NA", "NA"
+        self.r2_car_count, self.r2_truck_count, self.r2_passenger_count, self.r2_bus_count, self.r2_BoardingAlighting_count = "NA", "NA", "NA", "NA", "NA"
         self.true_car_count, self.estimated_car_count = None, estimated_car_count
         self.true_truck_count, self.estimated_truck_count = None, estimated_truck_count
         self.true_passenger_count, self.estimated_passenger_count = None, estimated_passenger_count
         self.true_bus_count, self.estimated_bus_count = None, estimated_bus_count
+        self.true_BoardingAlighting_count, self.estimated_BoardingAlighting_count = None, estimated_BoardingAlighting_count
+        self.true_stop_arrival_departure_travel_time_df, self.estimated_stop_arrival_departure_travel_time_df = None, estimated_stop_arrival_departure_travel_time_df
 
-        self.r2_car_cost, self.r2_truck_cost, self.r2_passenger_cost, self.r2_bus_cost = "NA", "NA", "NA", "NA"
+        self.r2_car_cost, self.r2_truck_cost, self.r2_passenger_cost, self.r2_bus_cost, self.r2_travel_and_dwell_time = "NA", "NA", "NA", "NA", "NA"
         self.true_car_cost, self.estimated_car_cost = None, estimated_car_cost
         self.true_truck_cost, self.estimated_truck_cost = None, estimated_truck_cost
         self.true_passenger_cost, self.estimated_passenger_cost = None, estimated_passenger_cost
@@ -4322,6 +6550,7 @@ class PostProcessing:
     def plot_breakdown_loss(self, loss_list, fig_name = 'breakdown_loss_pathflow.png'):
 
         if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_passenger_link_flow'] + self.dode.config['use_bus_link_flow'] + \
+            (self.dode.config['use_veh_run_boarding_alighting'] or  self.dode.config['use_ULP_f_transit']) + \
             self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt'] + self.dode.config['use_passenger_link_tt'] + self.dode.config['use_bus_link_tt']:
 
             plt.figure(figsize = (16, 9), dpi=300)
@@ -4348,6 +6577,11 @@ class PostProcessing:
                         color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Bus/Metro flow")
             i += self.dode.config['use_bus_link_flow']
 
+            if self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']:
+                plt.plot(np.arange(len(loss_list))+1, list(map(lambda x: x[1]['veh_run_boarding_alighting_loss']/loss_list[0][1]['veh_run_boarding_alighting_loss'], loss_list)),
+                        color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Boarding/Alighting flow")
+            i += (self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit'])
+
             if self.dode.config['use_car_link_tt']:
                 plt.plot(np.arange(len(loss_list))+1, list(map(lambda x: x[1]['car_tt_loss']/loss_list[0][1]['car_tt_loss'], loss_list)),
                     color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Car travel time")
@@ -4366,6 +6600,8 @@ class PostProcessing:
             if self.dode.config['use_bus_link_tt']:
                 plt.plot(np.arange(len(loss_list))+1, list(map(lambda x: x[1]['bus_tt_loss']/loss_list[0][1]['bus_tt_loss'], loss_list)), 
                         color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Bus travel time")
+                
+            
 
             plt.ylabel('Loss')
             plt.xlabel('Iteration')
@@ -4378,6 +6614,164 @@ class PostProcessing:
             plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
             # plt.show()
+
+    def plot_NMSE(self, loss_list, fig_name = 'NMSE.png'):
+        if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_passenger_link_flow'] + self.dode.config['use_bus_link_flow'] + \
+            (self.dode.config['use_veh_run_boarding_alighting'] or  self.dode.config['use_ULP_f_transit']) + \
+            self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt'] + self.dode.config['use_passenger_link_tt'] + self.dode.config['use_bus_link_tt']:
+
+            plt.figure(figsize = (16, 9), dpi=300)
+
+            i = 0
+
+            if self.dode.config['use_car_link_flow']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             x_e_car, _, _, _, _, _, _, _, _, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    if self.dode.config['car_count_agg']:
+                        L_car = self.one_data_dict['car_count_agg_L']
+                        x_e_car = L_car.dot(x_e_car)
+                    x_e_car = x_e_car[self.one_data_dict['mask_driving_link']]
+                    ind = ~(np.isinf(self.true_car_count) + np.isinf(x_e_car) + np.isnan(self.true_car_count) + np.isnan(x_e_car))
+                    nmse = np.mean(np.square(self.true_car_count[ind] - x_e_car[ind])) / np.mean(np.square(self.true_car_count[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Car flow")
+            i += self.dode.config['use_car_link_flow']
+
+            if self.dode.config['use_truck_link_flow']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             _, x_e_truck, _, _, _, _, _, _, _, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    if self.dode.config['truck_count_agg']:
+                        L_truck = self.one_data_dict['truck_count_agg_L']
+                        x_e_truck = L_truck.dot(x_e_truck)
+                    x_e_truck = x_e_truck[self.one_data_dict['mask_driving_link']]
+                    ind = ~(np.isinf(self.true_truck_count) + np.isinf(x_e_truck) + np.isnan(self.true_truck_count) + np.isnan(x_e_truck))
+                    nmse = np.mean(np.square(self.true_truck_count[ind] - x_e_truck[ind])) / np.mean(np.square(self.true_truck_count[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Truck flow")
+            i += self.dode.config['use_truck_link_flow']
+
+            if self.dode.config['use_passenger_link_flow']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             _, _, x_e_passenger, _, _, _, _, _, _, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    if self.dode.config['passenger_count_agg']:
+                        L_passenger = self.one_data_dict['passenger_count_agg_L']
+                        x_e_passenger = L_passenger.dot(x_e_passenger)
+                    if len(self.one_data_dict['mask_walking_link']) > 0:
+                        mask_passenger = np.concatenate(
+                            (self.one_data_dict['mask_bus_link'].reshape(-1, len(self.dode.observed_links_bus)), 
+                            self.one_data_dict['mask_walking_link'].reshape(-1, len(self.dode.observed_links_walking))), 
+                            axis=1
+                        )
+                        mask_passenger = mask_passenger.flatten()
+                    else:
+                        mask_passenger = self.one_data_dict['mask_bus_link']
+                    x_e_passenger = x_e_passenger[mask_passenger]
+                    ind = ~(np.isinf(self.true_passenger_count) + np.isinf(x_e_passenger) + np.isnan(self.true_passenger_count) + np.isnan(x_e_passenger))
+                    nmse = np.mean(np.square(self.true_passenger_count[ind] - x_e_passenger[ind])) / np.mean(np.square(self.true_passenger_count[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Passenger flow")
+            i += self.dode.config['use_passenger_link_flow']
+
+            if self.dode.config['use_bus_link_flow']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             _, _, _, x_e_bus, _, _, _, _, _, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    if self.dode.config['bus_count_agg']:
+                        L_bus = self.one_data_dict['bus_count_agg_L']
+                        x_e_bus = L_bus.dot(x_e_bus)
+                    x_e_bus = x_e_bus[self.one_data_dict['mask_bus_link']]
+                    ind = ~(np.isinf(self.true_bus_count) + np.isinf(x_e_bus) + np.isnan(self.true_bus_count) + np.isnan(x_e_bus))
+                    nmse = np.mean(np.square(self.true_bus_count[ind] - x_e_bus[ind])) / np.mean(np.square(self.true_bus_count[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Bus/Metro flow")
+            i += self.dode.config['use_bus_link_flow']
+
+            if self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             _, _, _, _, x_e_BoardingAlighting_count, _, _, _, _, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    x_e_BoardingAlighting_count = x_e_BoardingAlighting_count[self.one_data_dict['mask_observed_stops_vehs_record']]
+                    ind = ~(np.isinf(self.true_BoardingAlighting_count) + np.isinf(x_e_BoardingAlighting_count) + np.isnan(self.true_BoardingAlighting_count) + np.isnan(x_e_BoardingAlighting_count))
+                    nmse = np.mean(np.square(self.true_BoardingAlighting_count[ind] - x_e_BoardingAlighting_count[ind])) / np.mean(np.square(self.true_BoardingAlighting_count[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Boarding/Alighting flow")
+            i += (self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit'])
+
+            if self.dode.config['use_car_link_tt']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             _, _, _, _, _, tt_e_car, _, _, _, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    tt_e_car = tt_e_car[self.one_data_dict['mask_driving_link']]
+                    ind = ~(np.isinf(self.true_car_cost) + np.isinf(tt_e_car) + np.isnan(self.true_car_cost) + np.isnan(tt_e_car))
+                    nmse = np.mean(np.square(self.true_car_cost[ind] - tt_e_car[ind])) / np.mean(np.square(self.true_car_cost[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Car travel time")
+            i += self.dode.config['use_car_link_tt']
+
+            if self.dode.config['use_truck_link_tt']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             _, _, _, _, _, _, tt_e_truck, _, _, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    tt_e_truck = tt_e_truck[self.one_data_dict['mask_driving_link']]
+                    ind = ~(np.isinf(self.true_truck_cost) + np.isinf(tt_e_truck) + np.isnan(self.true_truck_cost) + np.isnan(tt_e_truck))
+                    nmse = np.mean(np.square(self.true_truck_cost[ind] - tt_e_truck[ind])) / np.mean(np.square(self.true_truck_cost[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Truck travel time")
+            i += self.dode.config['use_truck_link_tt']
+
+            if self.dode.config['use_passenger_link_tt']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             _, _, _, _, _, _, _, tt_e_passenger, _, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    if len(self.one_data_dict['mask_walking_link']) > 0:
+                        mask_passenger = np.concatenate(
+                            (self.one_data_dict['mask_bus_link'].reshape(-1, len(self.dode.observed_links_bus)), 
+                            self.one_data_dict['mask_walking_link'].reshape(-1, len(self.dode.observed_links_walking))), 
+                            axis=1
+                        )
+                        mask_passenger = mask_passenger.flatten()
+                    else:
+                        mask_passenger = self.one_data_dict['mask_bus_link']
+
+                    tt_e_passenger = tt_e_passenger[mask_passenger]
+                    ind = ~(np.isinf(self.true_passenger_cost) + np.isinf(tt_e_passenger) + np.isnan(self.true_passenger_cost) + np.isnan(tt_e_passenger))
+                    nmse = np.mean(np.square(self.true_passenger_cost[ind] - tt_e_passenger[ind])) / np.mean(np.square(self.true_passenger_cost[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Passenger travel time")
+            i += self.dode.config['use_passenger_link_tt']
+
+            if self.dode.config['use_bus_link_tt']:
+                nmse_list = []
+                for j in range(len(loss_list)):
+                    [_, _, _, _, _, _, _, _, _, _, _, _, _,
+                             _, _, _, _, _, _, _, _, tt_e_bus, _] = pickle.load(open(os.path.join(self.result_folder, str(j) + '_iteration_estimate_demand.pickle'), 'rb'))
+                    tt_e_bus = tt_e_bus[self.one_data_dict['mask_bus_link']]
+                    ind = ~(np.isinf(self.true_bus_cost) + np.isinf(tt_e_bus) + np.isnan(self.true_bus_cost) + np.isnan(tt_e_bus))
+                    nmse = np.mean(np.square(self.true_bus_cost[ind] - tt_e_bus[ind])) / np.mean(np.square(self.true_bus_cost[ind]))
+                    nmse_list.append(nmse)
+                plt.plot(np.arange(len(loss_list))+1, nmse_list, color = self.color_list[i],  marker = self.marker_list[i], linewidth = 3, label = "Bus travel time")
+
+
+            plt.ylabel('Normalized Mean Squared Error (NMSE)')
+            plt.xlabel('Iteration')
+            plt.legend(loc='lower center', ncol=3, bbox_to_anchor=(0.5, 1))
+            # plt.ylim([0, 1.1])
+            plt.xlim([1, len(loss_list)])
+            step = max(1, len(loss_list) // 10)  # Adjust step based on size (e.g., every ~10% of data)
+            plt.xticks(np.arange(1, len(loss_list) + 1, step))
+
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
 
     def get_one_data(self, start_intervals, end_intervals, j=0):
@@ -4394,6 +6788,9 @@ class PostProcessing:
 
         if 'mask_walking_link' not in self.one_data_dict:
             self.one_data_dict['mask_walking_link'] = np.ones(len(self.dode.observed_links_walking) * len(start_intervals), dtype=bool)
+
+        if 'mask_observed_stops_vehs_record' not in self.one_data_dict:
+            self.one_data_dict['mask_observed_stops_vehs_record'] = np.ones(len(self.dode.observed_stops_vehs_list), dtype=bool)
         
         # count
         if self.dode.config['use_car_link_flow']:
@@ -4443,6 +6840,24 @@ class PostProcessing:
                 self.estimated_bus_count = L_bus.dot(estimated_bus_x)
 
             self.true_bus_count, self.estimated_bus_count = self.true_bus_count[self.one_data_dict['mask_bus_link']], self.estimated_bus_count[self.one_data_dict['mask_bus_link']]
+
+        if self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']:
+            self.true_BoardingAlighting_count = self.one_data_dict['veh_run_boarding_alighting_record'][1]
+            if self.estimated_BoardingAlighting_count is None:
+                raw_boarding_alighting_record = self.dta.get_bus_boarding_alighting_record()
+                simulated_boarding_alighting_record_for_observed = self._massage_boarding_alighting_record(raw_boarding_alighting_record)
+                self.estimated_BoardingAlighting_count = simulated_boarding_alighting_record_for_observed[1]
+            self.true_BoardingAlighting_count, self.estimated_BoardingAlighting_count = \
+                self.true_BoardingAlighting_count[self.one_data_dict['mask_observed_stops_vehs_record']], \
+                self.estimated_BoardingAlighting_count[self.one_data_dict['mask_observed_stops_vehs_record']]
+            
+            if 'stop_arrival_departure_travel_time' in self.one_data_dict:
+                self.true_stop_arrival_departure_travel_time_df = self.one_data_dict['stop_arrival_departure_travel_time']
+                if self.estimated_stop_arrival_departure_travel_time_df is None:
+                    raw_boarding_alighting_record = self.dta.get_bus_boarding_alighting_record()
+                    stop_arrival_departure_travel_time_df = self.get_stop_arrival_departure_travel_time_df(raw_boarding_alighting_record)
+                    self.estimated_stop_arrival_departure_travel_time_df = stop_arrival_departure_travel_time_df
+
 
         # travel cost
         if self.dode.config['use_car_link_tt']:
@@ -4536,15 +6951,22 @@ class PostProcessing:
             ind = ~(np.isinf(self.true_bus_count) + np.isinf(self.estimated_bus_count) + np.isnan(self.true_bus_count) + np.isnan(self.estimated_bus_count))
             self.r2_bus_count = r2_score(np.round(self.true_bus_count[ind], decimals=0), np.round(self.estimated_bus_count[ind], decimals=0))
 
-        print("r2 count --- r2_car_count: {}, r2_truck_count: {}, r2_passenger_count: {}, r2_bus_count: {}"
-            .format(
+        if self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']:
+            ind = ~(np.isinf(self.true_BoardingAlighting_count) + np.isinf(self.estimated_BoardingAlighting_count) + 
+                    np.isnan(self.true_BoardingAlighting_count) + np.isnan(self.estimated_BoardingAlighting_count))
+            # assert there is no false in ind
+            assert np.all(ind)
+            self.r2_BoardingAlighting_count = r2_score(self.true_BoardingAlighting_count[ind], self.estimated_BoardingAlighting_count[ind])
+
+        print("r2 count --- r2_car_count: {}, r2_truck_count: {}, r2_passenger_count: {}, r2_bus_count: {}, r2_BoardingAlighting_count: {}".format(
                 self.r2_car_count,
                 self.r2_truck_count,
                 self.r2_passenger_count,
-                self.r2_bus_count
+                self.r2_bus_count,
+                self.r2_BoardingAlighting_count
                 ))
-        
-        return self.r2_car_count, self.r2_truck_count, self.r2_passenger_count, self.r2_bus_count
+
+        return self.r2_car_count, self.r2_truck_count, self.r2_passenger_count, self.r2_bus_count, self.r2_BoardingAlighting_count
 
     def scatter_plot_ODdemand(self, true_q_e_mode_driving, q_e_mode_driving,true_q_e_mode_bustransit, q_e_mode_bustransit, true_q_e_mode_pnr, q_e_mode_pnr, fig_name = 'OD_demand_scatterplot.png'):
         driving = 0 if true_q_e_mode_driving is None else 1
@@ -4600,14 +7022,34 @@ class PostProcessing:
         plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
         # plt.show()
 
+    def scatter_plot_totalODdemand_only(self, true_q_e_traveler, q_e_traveler, fig_name = 'OD_demand_scatterplot.png'):
+        plt.figure(figsize = (16, 9), dpi=300)
+        ax = plt.gca()
+        ind = ~(np.isinf(true_q_e_traveler) + np.isinf(q_e_traveler) + np.isnan(true_q_e_traveler) + np.isnan(q_e_traveler))
+        m_max = int(np.max((np.max(true_q_e_traveler[ind]), np.max(q_e_traveler[ind]))) + 1)
+        plt.scatter(true_q_e_traveler[ind], q_e_traveler[ind], color = self.color_list[0], marker = self.marker_list[0], s = 100)
+        plt.plot(range(m_max + 1), range(m_max + 1), color = 'gray')
+        plt.ylabel('Estimated demand')
+        plt.xlabel('True demand')
+        plt.xlim([0, m_max])
+        plt.ylim([0, m_max])
+        ax.text(0, 1, 'r2 = {}'.format(r2_score(true_q_e_traveler[ind], q_e_traveler[ind])),
+                    horizontalalignment='left',
+                    verticalalignment='top',
+                    transform=ax.transAxes)
+
+        plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
+        # plt.show()
 
     def scatter_plot_count(self, fig_name =  'link_flow_scatterplot_pathflow.png'):
         if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + \
-            self.dode.config['use_passenger_link_flow'] + self.dode.config['use_bus_link_flow']:
+            self.dode.config['use_passenger_link_flow'] + self.dode.config['use_bus_link_flow'] + \
+                (self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']):
 
             fig, axes = plt.subplots(1,
                                     self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + 
-                                    self.dode.config['use_passenger_link_flow'] + self.dode.config['use_bus_link_flow'], 
+                                    self.dode.config['use_passenger_link_flow'] + self.dode.config['use_bus_link_flow'] + 
+                                    (self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']), 
                                     figsize=(36, 9), dpi=300, squeeze=False)
 
             i = 0
@@ -4673,6 +7115,23 @@ class PostProcessing:
                             horizontalalignment='left',
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
+                
+            i += self.dode.config['use_bus_link_flow']
+                
+            if self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']:
+                ind = ~(np.isinf(self.true_BoardingAlighting_count) + np.isinf(self.estimated_BoardingAlighting_count) + 
+                        np.isnan(self.true_BoardingAlighting_count) + np.isnan(self.estimated_BoardingAlighting_count))
+                m_boarding_alighting_max = int(np.max((np.max(self.true_BoardingAlighting_count[ind]), np.max(self.estimated_BoardingAlighting_count[ind]))) + 1)
+                axes[0, i].scatter(self.true_BoardingAlighting_count[ind], self.estimated_BoardingAlighting_count[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
+                axes[0, i].plot(range(m_boarding_alighting_max + 1), range(m_boarding_alighting_max + 1), color = 'gray')
+                axes[0, i].set_ylabel('Estimated boarding/alighting flow')
+                axes[0, i].set_xlabel('Observed boarding/alighting flow')
+                axes[0, i].set_xlim([0, m_boarding_alighting_max])
+                axes[0, i].set_ylim([0, m_boarding_alighting_max])
+                axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_BoardingAlighting_count),
+                            horizontalalignment='left',
+                            verticalalignment='top',
+                            transform=axes[0, i].transAxes)
 
             plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
@@ -4711,24 +7170,50 @@ class PostProcessing:
             ind = ~(np.isinf(self.true_bus_cost) + np.isinf(self.estimated_bus_cost) + np.isnan(self.true_bus_cost) + np.isnan(self.estimated_bus_cost))
             self.r2_bus_cost = r2_score(self.true_bus_cost[ind], self.estimated_bus_cost[ind])
 
-        print("r2 cost --- r2_car_cost: {}, r2_truck_cost: {}, r2_passenger_cost: {}, r2_bus_cost: {}"
+        if (self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']) and 'stop_arrival_departure_travel_time' in self.one_data_dict:
+            merged_df = pd.merge(self.true_stop_arrival_departure_travel_time_df, self.estimated_stop_arrival_departure_travel_time_df, 
+                how='inner', on=['route_id','veh_order', 'stop_id'], 
+                suffixes=('_true', '_estimated'))
+            # drop rows with NaN values in either true or estimated travel time
+            merged_df = merged_df.dropna(subset=['pure_travel_time_true', 'pure_travel_time_estimated', 'travel_and_dwell_time_true', 'travel_and_dwell_time_estimated'])
+            # drop rows with non-positive travel times
+            merged_df = merged_df[(merged_df['pure_travel_time_true'] > 0) & (merged_df['pure_travel_time_estimated'] > 0) &
+                                  (merged_df['travel_and_dwell_time_true'] > 0) & (merged_df['travel_and_dwell_time_estimated'] > 0)]
+            merged_df.reset_index(inplace=True, drop=True)
+
+            estimated_travel_time = np.array(merged_df['travel_and_dwell_time_estimated'])
+            true_travel_time = np.array(merged_df['travel_and_dwell_time_true'])
+            self.estimated_stop_travel_dwell_time = estimated_travel_time
+            self.true_stop_travel_dwell_time = true_travel_time
+            self.r2_travel_and_dwell_time = r2_score(true_travel_time, estimated_travel_time)
+        
+
+        print("r2 cost --- r2_car_cost: {}, r2_truck_cost: {}, r2_passenger_cost: {}, r2_bus_cost: {}, r2_travel_and_dwell_time: {}"
             .format(
                 self.r2_car_cost, 
                 self.r2_truck_cost, 
                 self.r2_passenger_cost, 
-                self.r2_bus_cost
+                self.r2_bus_cost,
+                self.r2_travel_and_dwell_time
                 ))
 
-        return self.r2_car_cost, self.r2_truck_cost, self.r2_passenger_cost, self.r2_bus_cost
+        return self.r2_car_cost, self.r2_truck_cost, self.r2_passenger_cost, self.r2_bus_cost, self.r2_travel_and_dwell_time
 
     def scatter_plot_cost(self, fig_name = 'link_cost_scatterplot_pathflow.png'):
         if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt'] + \
-            self.dode.config['use_passenger_link_tt'] + self.dode.config['use_bus_link_tt']:
+            self.dode.config['use_passenger_link_tt'] + self.dode.config['use_bus_link_tt'] + \
+                (self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']):
 
-            fig, axes = plt.subplots(1, 
-                                    self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt'] + 
-                                    self.dode.config['use_passenger_link_tt'] + self.dode.config['use_bus_link_tt'], 
-                                    figsize=(36, 9), dpi=300, squeeze=False)
+            if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt'] + \
+                self.dode.config['use_passenger_link_tt'] + self.dode.config['use_bus_link_tt'] + \
+                ((self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']) and 'stop_arrival_departure_travel_time' in self.one_data_dict) == 1:
+                    fig, axes = plt.subplots(1, 1, figsize=(18, 9), dpi=300, squeeze=False)
+            else:
+                fig, axes = plt.subplots(1, 
+                                        self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt'] + 
+                                        self.dode.config['use_passenger_link_tt'] + self.dode.config['use_bus_link_tt'] + 
+                                        (self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']), 
+                                        figsize=(36, 9), dpi=300, squeeze=False)
             
             i = 0
 
@@ -4797,6 +7282,21 @@ class PostProcessing:
                             horizontalalignment='left',
                             verticalalignment='top',
                             transform=axes[0, i].transAxes)
+                
+            i += self.dode.config['use_bus_link_tt']
+                
+            if (self.dode.config['use_veh_run_boarding_alighting'] or self.dode.config['use_ULP_f_transit']) and 'stop_arrival_departure_travel_time' in self.one_data_dict:
+                m_travel_dwell_time_max = int(np.max((np.max(self.true_stop_travel_dwell_time), np.max(self.estimated_stop_travel_dwell_time))) + 1)
+                axes[0, i].scatter(self.true_stop_travel_dwell_time, self.estimated_stop_travel_dwell_time, color = self.color_list[i], marker = self.marker_list[i], s = 100)
+                axes[0, i].plot(range(m_travel_dwell_time_max + 1), range(m_travel_dwell_time_max + 1), color = 'gray')
+                axes[0, i].set_ylabel('Estimated stop-level travel+dwelling time')
+                axes[0, i].set_xlabel('Observed stop-level travel+dwelling time')
+                axes[0, i].set_xlim([0, m_travel_dwell_time_max])
+                axes[0, i].set_ylim([0, m_travel_dwell_time_max])
+                axes[0, i].text(0, 1, 'r2 = {}'.format(self.r2_travel_and_dwell_time),
+                            horizontalalignment='left',
+                            verticalalignment='top',
+                            transform=axes[0, i].transAxes)
 
             plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
 
@@ -4814,9 +7314,176 @@ class PostProcessing:
 #     if ss_total <= 1e-6:
 #         ss_total = 1e-6 
 #     return 1 - (ss_residual / ss_total)
+
+
+
+# directly use from sklearn.metrics import r2_score, this compute the fitting for y=x
+# def r2_score(y_true, y_hat):
+#     slope, intercept, r_value, p_value, std_err = scipy.stats.linregress(y_true, y_hat)
+#     # linear regression without intercept
+#     # slope, _, _, _ = np.linalg.lstsq(y_true[:, np.newaxis], y_hat)
+#     return r_value**2
+
+def swap_dict_and_array(beta, gamma, alpha):
+    beta_keys = ['beta_tt_car', 'beta_tt_bus', 'beta_tt_metro', 'beta_walking', 'beta_waiting_bus', 'beta_waiting_metro', 'beta_money']
+    gamma_keys = ['gamma_income_car', 'gamma_income_bus', 'gamma_income_metro', 'gamma_income_busmetro', 'gamma_income_carbus', 'gamma_income_carmetro', 'gamma_income_carbusmetro', \
+                  'gamma_Originpopden_car', 'gamma_Originpopden_bus', 'gamma_Originpopden_metro', 'gamma_Originpopden_busmetro', 'gamma_Originpopden_carbus', 'gamma_Originpopden_carmetro', 'gamma_Originpopden_carbusmetro', \
+                  'gamma_Destpopden_car', 'gamma_Destpopden_bus', 'gamma_Destpopden_metro', 'gamma_Destpopden_busmetro', 'gamma_Destpopden_carbus', 'gamma_Destpopden_carmetro', 'gamma_Destpopden_carbusmetro']
+    alpha_keys = ['alpha_bus', 'alpha_metro', 'alpha_busmetro', 'alpha_carbus', 'alpha_carmetro', 'alpha_carbusmetro']
+    if isinstance(beta, dict) and isinstance(gamma, dict) and isinstance(alpha, dict):
+        beta_array = np.zeros(len(beta))
+        for i in range(len(beta_keys)):
+            beta_array[i] = beta[beta_keys[i]]
+        gamma_array = np.zeros(len(gamma))
+        for i in range(len(gamma_keys)):
+            gamma_array[i] = gamma[gamma_keys[i]]
+        alpha_array = np.zeros(len(alpha))
+        for i in range(len(alpha_keys)):
+            alpha_array[i] = alpha[alpha_keys[i]]
+        return beta_array, gamma_array, alpha_array
+    elif isinstance(beta, np.ndarray) and isinstance(gamma, np.ndarray) and isinstance(alpha, np.ndarray):
+        beta_dict = dict()
+        for i in range(len(beta)):
+            beta_dict[beta_keys[i]] = beta[i]
+        gamma_dict = dict()
+        for i in range(len(gamma)):
+            gamma_dict[gamma_keys[i]] = gamma[i]
+        alpha_dict = dict()
+        for i in range(len(alpha)):
+            alpha_dict[alpha_keys[i]] = alpha[i]
+        return beta_dict, gamma_dict, alpha_dict
     
-def r2_score(y_true, y_hat):
-    slope, intercept, r_value, p_value, std_err = scipy.stats.linregress(y_true, y_hat)
-    # linear regression without intercept
-    # slope, _, _, _ = np.linalg.lstsq(y_true[:, np.newaxis], y_hat)
-    return r_value**2
+
+def compute_ULP_f(dar, b, lr, iter):
+    dar = dar.tocoo()
+    values = torch.tensor(dar.data, dtype=torch.float32)
+    indices = torch.tensor(np.vstack((dar.row, dar.col)), dtype=torch.int64)
+    A_sparse = torch.sparse_coo_tensor(indices, values, dar.shape).coalesce()
+
+    b = torch.tensor(b, dtype=torch.float32)
+
+    # Optimization variable (raw, unconstrained)
+    x_raw = torch.randn(A_sparse.shape[1], requires_grad=True)
+    optimizer = torch.optim.Adam([x_raw], lr=lr)
+
+    for i in range(iter):
+        optimizer.zero_grad()
+        x = torch.nn.functional.relu(x_raw)  # enforce x ≥ 0
+
+        # Use sparse-dense multiplication
+        Ax = torch.sparse.mm(A_sparse, x.unsqueeze(1)).squeeze()
+
+        loss = torch.norm(Ax - b) ** 2
+        loss.backward()
+        optimizer.step()
+
+    x_final = torch.nn.functional.relu(x_raw).detach().cpu().numpy()
+    return x_final
+
+
+def compute_ULP_f_Gurobi(A, b):
+    m, n = A.shape
+
+    # -------- STEP 1: Try to solve Ax = b, x >= 0 -------- #
+    model_lp = gp.Model("feasibility_sparse")
+    x = model_lp.addVars(n, lb=0.0, vtype=GRB.CONTINUOUS, name="x")
+    model_lp.setObjective(0, GRB.MINIMIZE)
+
+    # Convert to COO for easier row/column indexing
+    A_coo = A.tocoo()
+    rows = [[] for _ in range(m)]
+
+    for i, j, v in zip(A_coo.row, A_coo.col, A_coo.data):
+        rows[i].append((j, v))
+
+    # Add constraints: Ax = b
+    for i in range(m):
+        expr = gp.LinExpr()
+        for j, val in rows[i]:
+            expr.add(x[j], val)
+        model_lp.addConstr(expr == b[i], name=f"eq_{i}")
+
+    model_lp.setParam('OutputFlag', 0)
+    model_lp.optimize()
+
+    if model_lp.status == GRB.OPTIMAL:
+        solution = np.array([x[i].X for i in range(n)])
+        # print("Feasible solution found (Ax = b, x >= 0):")
+        # print("x =", solution)
+    else:
+        # print("No feasible solution. Solving least-squares with x >= 0...")
+
+        # -------- STEP 2: Solve min ||Ax - b||^2 with x >= 0 -------- #
+        model_qp = gp.Model("least_squares_sparse")
+        x_qp = model_qp.addVars(n, lb=0.0, vtype=GRB.CONTINUOUS, name="x_qp")
+
+        obj = gp.QuadExpr()
+        for i in range(m):
+            expr = gp.LinExpr()
+            for j, val in rows[i]:
+                expr.add(x_qp[j], val)
+            expr.addConstant(-b[i])
+            obj += expr * expr
+
+        model_qp.setObjective(obj, GRB.MINIMIZE)
+        model_qp.setParam('OutputFlag', 0)
+        model_qp.optimize()
+
+        if model_qp.status == GRB.OPTIMAL:
+            solution = np.array([x_qp[i].X for i in range(n)])
+            # print("Least-squares solution (min ||Ax - b||^2, x >= 0):")
+            # print("x =", solution)
+            # print("Residual norm ||Ax - b|| =", np.linalg.norm(A @ solution - b))
+            # print('R2 score:', r2_score(b, A @ solution))
+        else:
+            #print("Quadratic program failed.")
+            solution = None
+    return solution
+
+
+def compute_Jacobian(Jacobian_dict, beta_dict, beta_der_dict, gamma_der_dict, alpha_der_dict):
+    car_count_J_beta, car_count_J_gamma, car_count_J_alpha = dict(), dict(), dict()
+    car_time_J_beta, car_time_J_gamma, car_time_J_alpha = dict(), dict(), dict()
+    BoardingAlightingCount_J_beta, BoardingAlightingCount_J_gamma, BoardingAlightingCount_J_alpha = dict(), dict(), dict()
+    for key in beta_dict.keys():
+        if key == 'beta_tt_car':
+            car_count_J_beta[key] = np.dot(Jacobian_dict['car_count_J_f_driving'], beta_der_dict[key]['driving'].flatten(order='F').reshape(-1, 1)) + \
+                            np.dot(Jacobian_dict['car_count_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1))
+            car_time_J_beta[key] = np.dot(Jacobian_dict['car_time_J_f_driving'], beta_der_dict[key]['driving'].flatten(order='F').reshape(-1, 1)) + \
+                            np.dot(Jacobian_dict['car_time_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1))
+            BoardingAlightingCount_J_beta[key] = np.dot(Jacobian_dict['BoardingAlightingCount_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1))
+        elif key == 'beta_money':
+            car_count_J_beta[key] = np.dot(Jacobian_dict['car_count_J_f_driving'], beta_der_dict[key]['driving'].flatten(order='F').reshape(-1, 1)) + \
+                            np.dot(Jacobian_dict['car_count_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1)) + \
+                            np.dot(Jacobian_dict['car_count_J_f_transit'], beta_der_dict[key]['transit'].flatten(order='F').reshape(-1, 1))
+            car_time_J_beta[key] = np.dot(Jacobian_dict['car_time_J_f_driving'], beta_der_dict[key]['driving'].flatten(order='F').reshape(-1, 1)) + \
+                            np.dot(Jacobian_dict['car_time_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1)) 
+            BoardingAlightingCount_J_beta[key] = np.dot(Jacobian_dict['BoardingAlightingCount_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1)) + \
+                            np.dot(Jacobian_dict['BoardingAlightingCount_J_f_transit'], beta_der_dict[key]['transit'].flatten(order='F').reshape(-1, 1))
+        else:
+            car_count_J_beta[key] = np.dot(Jacobian_dict['car_count_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1))
+            car_time_J_beta[key] = np.dot(Jacobian_dict['car_time_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1))
+            BoardingAlightingCount_J_beta[key] = np.dot(Jacobian_dict['BoardingAlightingCount_J_f_transit'], beta_der_dict[key]['transit'].flatten(order='F').reshape(-1, 1)) +\
+                np.dot(Jacobian_dict['BoardingAlightingCount_J_f_pnr'], beta_der_dict[key]['pnr'].flatten(order='F').reshape(-1, 1))
+    for string1 in ['income', 'Originpopden', 'Destpopden']:
+        car_count_J_gamma['gamma_' + string1 + '_car'] = np.dot(Jacobian_dict['car_count_J_f_driving'], gamma_der_dict['gamma_' + string1 + '_car'].flatten(order='F').reshape(-1, 1))
+        car_time_J_gamma['gamma_' + string1 + '_car'] = np.dot(Jacobian_dict['car_time_J_f_driving'], gamma_der_dict['gamma_' + string1 + '_car'].flatten(order='F').reshape(-1, 1))
+        BoardingAlightingCount_J_gamma['gamma_' + string1 + '_car'] = np.zeros((Jacobian_dict['BoardingAlightingCount_J_f_pnr'].shape[0], 1))
+        for string2 in ['bus', 'metro', 'busmetro']:
+            car_count_J_gamma['gamma_' + string1 + '_' + string2] = np.zeros((Jacobian_dict['car_count_J_f_pnr'].shape[0], 1))  
+            car_time_J_gamma['gamma_' + string1 + '_' + string2] = np.zeros((Jacobian_dict['car_time_J_f_pnr'].shape[0], 1))
+            BoardingAlightingCount_J_gamma['gamma_' + string1 + '_' + string2] = np.dot(Jacobian_dict['BoardingAlightingCount_J_f_transit'],\
+                                                                                         gamma_der_dict['gamma_' + string1 + '_' + string2].flatten(order='F').reshape(-1, 1))    
+        for string2 in ['carbus', 'carmetro', 'carbusmetro']:
+            car_count_J_gamma['gamma_' + string1 + '_' + string2] = np.dot(Jacobian_dict['car_count_J_f_pnr'], gamma_der_dict['gamma_' + string1 + '_' + string2].flatten(order='F').reshape(-1, 1))
+            car_time_J_gamma['gamma_' + string1 + '_' + string2] = np.dot(Jacobian_dict['car_time_J_f_pnr'], gamma_der_dict['gamma_' + string1 + '_' + string2].flatten(order='F').reshape(-1, 1))
+            BoardingAlightingCount_J_gamma['gamma_' + string1 + '_' + string2] = np.dot(Jacobian_dict['BoardingAlightingCount_J_f_pnr'], \
+                                                                                        gamma_der_dict['gamma_' + string1 + '_' + string2].flatten(order='F').reshape(-1, 1))
+    for string1 in ['bus', 'metro', 'busmetro']:
+        car_count_J_alpha['alpha_' + string1] = np.zeros((Jacobian_dict['car_count_J_f_pnr'].shape[0], 1))
+        car_time_J_alpha['alpha_' + string1] = np.zeros((Jacobian_dict['car_time_J_f_pnr'].shape[0], 1))
+        BoardingAlightingCount_J_alpha['alpha_' + string1] = np.dot(Jacobian_dict['BoardingAlightingCount_J_f_transit'], alpha_der_dict['alpha_' + string1].flatten(order='F').reshape(-1, 1))
+    for string1 in ['carbus', 'carmetro', 'carbusmetro']:
+        car_count_J_alpha['alpha_' + string1] = np.dot(Jacobian_dict['car_count_J_f_pnr'], alpha_der_dict['alpha_' + string1].flatten(order='F').reshape(-1, 1))
+        car_time_J_alpha['alpha_' + string1] = np.dot(Jacobian_dict['car_time_J_f_pnr'], alpha_der_dict['alpha_' + string1].flatten(order='F').reshape(-1, 1))
+        BoardingAlightingCount_J_alpha['alpha_' + string1] = np.dot(Jacobian_dict['BoardingAlightingCount_J_f_pnr'], alpha_der_dict['alpha_' + string1].flatten(order='F').reshape(-1, 1))
