@@ -595,8 +595,19 @@ class MMDODE:
             a.run_whole(show_loading)
         # print("Finish simulation", time.time())
 
-        # travel_stats = a.get_travel_stats()
-        print(a.print_travel_stats())
+        travel_stats = a.get_travel_stats()
+        assert(len(travel_stats) == 9)
+        print("\n************ travel stats ************")
+        print("car count: {}".format(travel_stats[0]))
+        print("car pnr count: {}".format(travel_stats[1]))
+        print("truck count: {}".format(travel_stats[2]))
+        print("bus count: {}".format(travel_stats[3]))
+        print("passenger count: {}".format(travel_stats[4]))
+        print("car total travel time (hours): {}".format(travel_stats[5]))
+        print("truck total travel time (hours): {}".format(travel_stats[6]))
+        print("bus total travel time (hours): {}".format(travel_stats[7]))
+        print("passenger total travel time (hours): {}".format(travel_stats[8]))
+        print("************ travel stats ************\n")
 
         # print_emission_stats() only works if folder is not removed, cannot find reason
         a.print_emission_stats()
