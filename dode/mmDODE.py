@@ -1283,11 +1283,10 @@ class MMDODE:
             f_passenger_pnr_grad += passenger_BoardingAlighting_dar_pnr.T.dot(passenger_BoardingAlighting_grad)
 
         if self.config['use_ULP_f_transit']:
-            # f_transit_ULP = spla.lsqr(passenger_BoardingAlighting_dar_transit, one_data_dict['veh_run_boarding_alighting_record'][1])[0] 
-            # f_transit_ULP = lsq_linear(passenger_BoardingAlighting_dar_transit, one_data_dict['veh_run_boarding_alighting_record'][1], bounds=(0, np.inf), max_iter=2).x
-            # f_transit_ULP = compute_ULP_f(passenger_BoardingAlighting_dar_transit, one_data_dict['veh_run_boarding_alighting_record'][1], 5e-1, 3000)
             mask_record = one_data_dict['mask_observed_stops_vehs_record']
             row_indices = np.where(mask_record)[0]
+            # f_transit_ULP = lsq_linear(passenger_BoardingAlighting_dar_transit[row_indices], one_data_dict['veh_run_boarding_alighting_record'][1][mask_record], bounds=(0, np.inf), max_iter=1).x
+            # f_transit_ULP = compute_ULP_f(passenger_BoardingAlighting_dar_transit[row_indices], one_data_dict['veh_run_boarding_alighting_record'][1][mask_record], 5e-1, 3000)
             f_transit_ULP = compute_ULP_f_Gurobi(passenger_BoardingAlighting_dar_transit[row_indices], one_data_dict['veh_run_boarding_alighting_record'][1][mask_record])
             if f_transit_ULP is None:
                 print("Warning: f_transit_ULP is None, update based on gradient")
