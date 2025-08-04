@@ -814,11 +814,11 @@ class MCDODE():
             car_grad += self.config['link_car_tt_weight'] * grad
 
             ## Original Wei's method
-            f_car_grad += car_dar.T.dot(car_grad)
+            # f_car_grad += car_dar.T.dot(car_grad)
 
             ## MCDODE's method
-            # _tt_loss_grad_on_car_link_flow = self._compute_tt_loss_grad_on_car_link_flow(dta, car_grad)
-            # f_car_grad += car_dar.T.dot(_tt_loss_grad_on_car_link_flow)
+            _tt_loss_grad_on_car_link_flow = self._compute_tt_loss_grad_on_car_link_flow(dta, car_grad, one_data_dict)
+            f_car_grad += car_dar.T.dot(_tt_loss_grad_on_car_link_flow)
 
             ## IPMC method
             # f_car_grad += car_ltg_matrix.T.dot(car_grad)
@@ -828,11 +828,11 @@ class MCDODE():
             truck_grad += self.config['link_truck_tt_weight'] * grad
 
             ## Original Wei's method
-            f_truck_grad += truck_dar.T.dot(truck_grad)
+            # f_truck_grad += truck_dar.T.dot(truck_grad)
 
             ## MCDODE's method
-            # _tt_loss_grad_on_truck_link_flow = self._compute_tt_loss_grad_on_truck_link_flow(dta, truck_grad)
-            # f_truck_grad += truck_dar.T.dot(_tt_loss_grad_on_truck_link_flow)
+            _tt_loss_grad_on_truck_link_flow = self._compute_tt_loss_grad_on_truck_link_flow(dta, truck_grad, one_data_dict)
+            f_truck_grad += truck_dar.T.dot(_tt_loss_grad_on_truck_link_flow)
 
             ## IPMC method
             # f_truck_grad += truck_ltg_matrix.T.dot(truck_grad)
@@ -941,19 +941,19 @@ class MCDODE():
         # tt_e[ind] = np.inf
         return grad, tt_e
 
-    def _compute_tt_loss_grad_on_car_link_flow(self, dta, tt_loss_grad_on_car_link_tt):
-        _link_tt_grad_on_link_flow_car = self._compute_link_tt_grad_on_link_flow_car(dta)
+    def _compute_tt_loss_grad_on_car_link_flow(self, dta, tt_loss_grad_on_car_link_tt, one_data_dict):
+        _link_tt_grad_on_link_flow_car = self._compute_link_tt_grad_on_link_flow_car(dta, one_data_dict)
         grad = _link_tt_grad_on_link_flow_car.dot(tt_loss_grad_on_car_link_tt)
         grad = grad / (np.linalg.norm(grad) + 1e-7)
         return grad
 
-    def _compute_tt_loss_grad_on_truck_link_flow(self, dta, tt_loss_grad_on_truck_link_tt):
-        _link_tt_grad_on_link_flow_truck = self._compute_link_tt_grad_on_link_flow_truck(dta)
+    def _compute_tt_loss_grad_on_truck_link_flow(self, dta, tt_loss_grad_on_truck_link_tt, one_data_dict):
+        _link_tt_grad_on_link_flow_truck = self._compute_link_tt_grad_on_link_flow_truck(dta, one_data_dict)
         grad = _link_tt_grad_on_link_flow_truck.dot(tt_loss_grad_on_truck_link_tt)
         grad = grad / (np.linalg.norm(grad) + 1e-7)
         return grad
 
-    def _compute_link_tt_grad_on_link_flow_car(self, dta):
+    def _compute_link_tt_grad_on_link_flow_car(self, dta, one_data_dict):
         assign_intervals = np.arange(0, self.num_loading_interval, self.ass_freq)
         num_assign_intervals = len(assign_intervals)
         num_links = len(self.observed_links)
@@ -975,7 +975,11 @@ class MCDODE():
 
         # tt_free = np.array(list(map(lambda x: self.nb.get_link_driving(x).get_car_fft(), self.observed_links)))
         tt_free = dta.get_car_link_fftt(self.observed_links)
-        mask = tt_e > tt_free[:, np.newaxis]
+
+        tt_e = np.maximum(tt_e, np.tile(tt_free[:, np.newaxis], (self.num_assign_interval))) 
+        tt_o = np.maximum(one_data_dict['car_link_tt'].reshape((self.num_assign_interval, num_links)).T, np.tile(tt_free[:, np.newaxis], (self.num_assign_interval))) 
+
+        mask = (tt_e > tt_free[:, np.newaxis]) & (tt_o > tt_free[:, np.newaxis])
 
         # no congestions
         if np.sum(mask) == 0:
@@ -1013,25 +1017,28 @@ class MCDODE():
         row = list()
         col = list()
 
+        # may depends on the minimum flow from count data
+        max_outflow_time = 65  # seconds
         for i, assign_interval in enumerate(assign_intervals):
             for j, link_ID in enumerate(self.observed_links):
                 _tmp = outflow_avg_rate[j, i]
 
-                if _tmp > 0:
-                    _tmp = 1 / _tmp
-                else:
-                    _tmp = 1
-
-                # if mask[j, i]:
-                #     if _tmp > 0:
-                #         # in case 1 / c is very big
-                #         # _tmp = np.minimum(1 / _tmp, 1)  # seconds
-                #         _tmp = 1 / _tmp
-                #     else:
-                #         _tmp = 1
+                # if _tmp > 0:
+                #     _tmp = 1 / _tmp
                 # else:
-                #     # help retain the sign of - (tt_o - tt_e)
                 #     _tmp = 1
+
+                # help retain the sign of - (tt_o - tt_e)
+                if mask[j, i]:
+                    # _tmp = 3600 / (self.nb.get_link(link_ID).cap_car * self.nb.get_link(link_ID).lanes) 
+                    if _tmp > 0:
+                        # in case 1 / c is very big
+                        _tmp = np.minimum(1 / _tmp, max_outflow_time)  # seconds
+                        # _tmp = 1 / _tmp
+                    else:
+                        _tmp = max_outflow_time
+                else:
+                    _tmp = 0
                 
                 val.append(_tmp)
                 row.append(j + num_links * i)
@@ -1044,7 +1051,7 @@ class MCDODE():
         # grad = grad / (scipy.sparse.linalg.norm(grad) + 1e-7)
         return grad
 
-    def _compute_link_tt_grad_on_link_flow_truck(self, dta):
+    def _compute_link_tt_grad_on_link_flow_truck(self, dta, one_data_dict):
         assign_intervals = np.arange(0, self.num_loading_interval, self.ass_freq)
         num_assign_intervals = len(assign_intervals)
         num_links = len(self.observed_links)
@@ -1064,7 +1071,10 @@ class MCDODE():
 
         # tt_free = np.array(list(map(lambda x: self.nb.get_link_driving(x).get_truck_fft(), self.observed_links)))
         tt_free = dta.get_truck_link_fftt(self.observed_links)
-        mask = tt_e > tt_free[:, np.newaxis]
+        tt_e = np.maximum(tt_e, np.tile(tt_free[:, np.newaxis], (self.num_assign_interval))) 
+        tt_o = np.maximum(one_data_dict['truck_link_tt'].reshape((self.num_assign_interval, num_links)).T, np.tile(tt_free[:, np.newaxis], (self.num_assign_interval))) 
+
+        mask = (tt_e > tt_free[:, np.newaxis]) & (tt_o > tt_free[:, np.newaxis])
 
         # no congestions
         if np.sum(mask) == 0:
@@ -1102,25 +1112,28 @@ class MCDODE():
         row = list()
         col = list()
 
+        # may depends on the minimum flow from count data
+        max_outflow_time = 65  # seconds
         for i, assign_interval in enumerate(assign_intervals):
             for j, link_ID in enumerate(self.observed_links):
                 _tmp = outflow_avg_rate[j, i]
 
-                if _tmp > 0:
-                    _tmp = 1 / _tmp
-                else:
-                    _tmp = 1
-
-                # if mask[j, i]:
-                #     if _tmp > 0:
-                #         # in case 1 / c is very big
-                #         # _tmp = np.minimum(1 / _tmp, 1)  # seconds
-                #         _tmp = 1 / _tmp
-                #     else:
-                #         _tmp = 1
+                # if _tmp > 0:
+                #     _tmp = 1 / _tmp
                 # else:
-                #     # help retain the sign of - (tt_o - tt_e)
                 #     _tmp = 1
+
+                # help retain the sign of - (tt_o - tt_e)
+                if mask[j, i]:
+                    # _tmp = 3600 / (self.nb.get_link(link_ID).cap_truck * self.nb.get_link(link_ID).lanes) 
+                    if _tmp > 0:
+                        # in case 1 / c is very big
+                        _tmp = np.minimum(1 / _tmp, max_outflow_time)  # seconds
+                        # _tmp = 1 / _tmp
+                    else:
+                        _tmp = max_outflow_time
+                else:
+                    _tmp = 0
                 
                 val.append(_tmp)
                 row.append(j + num_links * i)
@@ -2541,6 +2554,10 @@ class PostProcessing:
         self.true_car_speed, self.estimated_car_speed = None, None
         self.true_truck_speed, self.estimated_truck_speed = None, None
 
+        self.r2_car_tti, self.r2_truck_tti = "NA", "NA"
+        self.true_car_tti, self.estimated_car_tti = None, None
+        self.true_truck_tti, self.estimated_truck_tti = None, None
+
         self.r2_origin_vehicle_registration = "NA"
         self.true_origin_vehicle_registration, self.estimated_origin_vehicle_registration = None, None
         self.estimated_origin_demand = estimated_origin_demand
@@ -2558,6 +2575,28 @@ class PostProcessing:
 
         sns.set_theme()
         plt.style.use(plt_style)
+
+    def get_TTI_classification(self, x):
+        if np.isnan(x):
+            return np.nan
+        # https://jiaotong.baidu.com/congestion/city/urbanpredict
+        if 1 <= x < 1.5: 
+            return 1.25
+        elif 1.5 <= x < 2: 
+            return 1.75
+        elif 2 <= x < 4: 
+            return 3
+        else: 
+            return 5
+        
+        # if 1 <= x < 1.1: 
+        #     return 'green', 'Free Flow'
+        # elif 1.1 <= x < 1.3: 
+        #     return 'orange', 'Light Congestion'
+        # elif 1.3 <= x < 1.5: 
+        #     return 'deeppink', 'Moderate Congestion'
+        # else: 
+        #     return 'darkred', 'Heavy Congestion'
 
     def plot_total_loss(self, loss_list, fig_name = 'total_loss_pathflow.png'):
 
@@ -2657,6 +2696,8 @@ class PostProcessing:
         
             self.true_car_cost = np.maximum(self.one_data_dict['car_link_tt'], tt_free)
 
+            self.true_car_tti = np.array([self.get_TTI_classification(x) for x in (self.true_car_cost / tt_free)])
+
             self.true_car_speed = self.link_length[np.newaxis, :] / self.true_car_cost.reshape(len(start_intervals), -1) * 3600 # mph
             self.true_car_speed = self.true_car_speed.flatten(order='C')
             
@@ -2666,12 +2707,14 @@ class PostProcessing:
             
             self.estimated_car_cost = np.maximum(self.estimated_car_cost, tt_free)
 
+            self.estimated_car_tti = np.array([self.get_TTI_classification(x) for x in (self.estimated_car_cost / tt_free)])
+
             if self.link_length is not None:
                 self.estimated_car_speed = self.link_length[np.newaxis, :] / self.estimated_car_cost.reshape(len(start_intervals), -1) * 3600  # mph
                 self.estimated_car_speed = self.estimated_car_speed.flatten(order='C')
 
             self.true_car_cost, self.estimated_car_cost = self.true_car_cost[self.one_data_dict['mask_driving_link']], self.estimated_car_cost[self.one_data_dict['mask_driving_link']]
-
+            self.true_car_tti, self.estimated_car_tti = self.true_car_tti[self.one_data_dict['mask_driving_link']], self.estimated_car_tti[self.one_data_dict['mask_driving_link']]
             if self.link_length is not None:
                 self.true_car_speed, self.estimated_car_speed = self.true_car_speed[self.one_data_dict['mask_driving_link']], self.estimated_car_speed[self.one_data_dict['mask_driving_link']]
 
@@ -2680,6 +2723,8 @@ class PostProcessing:
             tt_free = np.tile(list(map(lambda x: self.dode.nb.get_link(x).get_truck_fft(), self.dode.observed_links)), (self.dode.num_assign_interval))
         
             self.true_truck_cost = np.maximum(self.one_data_dict['truck_link_tt'], tt_free)
+
+            self.true_truck_tti = np.array([self.get_TTI_classification(x) for x in (self.true_truck_cost / tt_free)])
 
             self.true_truck_speed = self.link_length[np.newaxis, :] / self.true_truck_cost.reshape(len(start_intervals), -1) * 3600
             self.true_truck_speed = self.true_truck_speed.flatten(order='C')
@@ -2690,12 +2735,14 @@ class PostProcessing:
             
             self.estimated_truck_cost = np.maximum(self.estimated_truck_cost, tt_free)
 
+            self.estimated_truck_tti = np.array([self.get_TTI_classification(x) for x in (self.estimated_truck_cost / tt_free)])
+
             if self.link_length is not None:
                 self.estimated_truck_speed = self.link_length[np.newaxis, :] / self.estimated_truck_cost.reshape(len(start_intervals), -1) * 3600 
                 self.estimated_truck_speed = self.estimated_truck_speed.flatten(order='C')
             
             self.true_truck_cost, self.estimated_truck_cost = self.true_truck_cost[self.one_data_dict['mask_driving_link']], self.estimated_truck_cost[self.one_data_dict['mask_driving_link']]
-
+            self.true_truck_tti, self.estimated_truck_tti = self.true_truck_tti[self.one_data_dict['mask_driving_link']], self.estimated_truck_tti[self.one_data_dict['mask_driving_link']]
             if self.link_length is not None:
                 self.true_truck_speed, self.estimated_truck_speed = self.true_truck_speed[self.one_data_dict['mask_driving_link']], self.estimated_truck_speed[self.one_data_dict['mask_driving_link']]
 
@@ -3001,6 +3048,41 @@ class PostProcessing:
                 ))
 
         return self.r2_car_speed, self.r2_truck_speed
+    
+    def cal_r2_tti(self):
+        if self.dode.config['use_car_link_tt']:
+            if self.true_car_speed is not None and self.estimated_car_speed is not None:
+                print('----- car tti -----')
+                print(self.true_car_tti)
+                print(self.estimated_car_tti)
+                print('----- car tti -----')
+                # ind = ~((self.true_car_tti > 90) + (self.estimated_car_tti > 90) + (self.true_car_tti < 10) + (self.estimated_car_tti < 10) + np.isnan(self.true_car_tti) + np.isnan(self.estimated_car_tti) + (self.estimated_car_tti > 3 * self.true_car_tti)
+                #         + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost) + (self.estimated_car_cost > 3 * self.true_car_cost))
+                ind = ~(np.isnan(self.true_car_tti) + np.isnan(self.estimated_car_tti) + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost))
+                self.r2_car_tti = r2_score(self.true_car_tti[ind], self.estimated_car_tti[ind])
+            else:
+                print("Car tti not calculated.")
+
+        if self.dode.config['use_truck_link_tt']:
+            if self.true_truck_tti is not None and self.estimated_truck_tti is not None:
+                print('----- truck tti -----')
+                print(self.true_truck_tti)
+                print(self.estimated_truck_tti)
+                print('----- truck tti -----')
+                # ind = ~((self.true_truck_tti > 90) + (self.estimated_truck_tti > 90) + (self.true_truck_tti < 10) + (self.estimated_truck_tti < 10) + np.isnan(self.true_truck_tti) + np.isnan(self.estimated_truck_tti) + (self.estimated_truck_tti > 3 * self.true_truck_tti)
+                #         + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost) + (self.estimated_truck_cost > 3 * self.true_truck_cost))
+                ind = ~(np.isnan(self.true_truck_tti) + np.isnan(self.estimated_truck_tti) + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost))
+                self.r2_truck_tti = r2_score(self.true_truck_tti[ind], self.estimated_truck_tti[ind])
+            else:
+                print("Truck tti not calculated.")
+
+        print("r2 tti --- r2_car_tti: {}, r2_truck_tti: {}"
+            .format(
+                self.r2_car_tti, 
+                self.r2_truck_tti
+                ))
+
+        return self.r2_car_tti, self.r2_truck_tti
 
     def scatter_plot_cost(self, fig_name='link_cost_scatterplot_pathflow.png'):
         if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
@@ -3238,6 +3320,141 @@ class PostProcessing:
                     plt.show()
                     plt.close()
 
+    def scatter_plot_tti(self, fig_name='link_tti_scatterplot_pathflow.png'):
+
+        if self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
+            n = self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']
+            fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
+            
+            i = 0
+
+            if self.dode.config['use_car_link_tt'] and (self.true_car_tti is not None and self.estimated_car_tti is not None):
+                # ind = ~((self.true_car_tti > 90) + (self.estimated_car_tti > 90) + (self.true_car_tti < 10) + (self.estimated_car_tti < 10) + np.isnan(self.true_car_tti) + np.isnan(self.estimated_car_tti) + (self.estimated_car_tti > 3 * self.true_car_tti)
+                #          + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost) + (self.estimated_car_cost > 3 * self.true_car_cost))
+                ind = ~(np.isnan(self.true_car_tti) + np.isnan(self.estimated_car_tti) + np.isinf(self.true_car_cost) + np.isinf(self.estimated_car_cost) + np.isnan(self.true_car_cost) + np.isnan(self.estimated_car_cost))
+            
+                car_tti_min = np.min((np.min(self.true_car_tti[ind]), np.min(self.estimated_car_tti[ind]))) - 1
+                car_tti_max = np.max((np.max(self.true_car_tti[ind]), np.max(self.estimated_car_tti[ind]))) + 1
+                axes[0, i].scatter(self.true_car_tti[ind], self.estimated_car_tti[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
+                axes[0, i].plot(np.linspace(car_tti_min, car_tti_max, 20), np.linspace(car_tti_min, car_tti_max, 20), color = 'gray')
+                axes[0, i].set_ylabel('Estimated observed link tti for car')
+                axes[0, i].set_xlabel('True observed link tti for car')
+                axes[0, i].set_xlim([car_tti_min, car_tti_max])
+                axes[0, i].set_ylim([car_tti_min, car_tti_max])
+                axes[0, i].set_box_aspect(1)
+                axes[0, i].text(0, 1, 'r2 = {:.3f}'.format(self.r2_car_tti),
+                            horizontalalignment='left',
+                            verticalalignment='top',
+                            transform=axes[0, i].transAxes)
+
+            i += self.dode.config['use_car_link_tt']
+
+            if self.dode.config['use_truck_link_tt'] and (self.true_truck_tti is not None and self.estimated_truck_tti is not None):
+                # ind = ~((self.true_truck_tti > 90) + (self.estimated_truck_tti > 90) + (self.true_truck_tti < 10) + (self.estimated_truck_tti < 10) + np.isnan(self.true_truck_tti) + np.isnan(self.estimated_truck_tti) + (self.estimated_truck_tti > 3 * self.true_truck_tti)
+                #         + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost) + (self.estimated_truck_cost > 3 * self.true_truck_cost))
+                ind = ~(np.isnan(self.true_truck_tti) + np.isnan(self.estimated_truck_tti) + np.isinf(self.true_truck_cost) + np.isinf(self.estimated_truck_cost) + np.isnan(self.true_truck_cost) + np.isnan(self.estimated_truck_cost))
+            
+                truck_tti_min = np.min((np.min(self.true_truck_tti[ind]), np.min(self.estimated_truck_tti[ind]))) - 1
+                truck_tti_max = np.max((np.max(self.true_truck_tti[ind]), np.max(self.estimated_truck_tti[ind]))) + 1
+                axes[0, i].scatter(self.true_truck_tti[ind], self.estimated_truck_tti[ind], color = self.color_list[i], marker = self.marker_list[i], s = 100)
+                axes[0, i].plot(np.linspace(truck_tti_min, truck_tti_max, 20), np.linspace(truck_tti_min, truck_tti_max, 20), color = 'gray')
+                axes[0, i].set_ylabel('Estimated observed link tti for truck')
+                axes[0, i].set_xlabel('True observed link tti for truck')
+                axes[0, i].set_xlim([truck_tti_min, truck_tti_max])
+                axes[0, i].set_ylim([truck_tti_min, truck_tti_max])
+                axes[0, i].set_box_aspect(1)
+                axes[0, i].text(0, 1, 'r2 = {:.3f}'.format(self.r2_truck_tti),
+                            horizontalalignment='left',
+                            verticalalignment='top',
+                            transform=axes[0, i].transAxes)
+
+            plt.savefig(os.path.join(self.result_folder, fig_name), bbox_inches='tight')
+
+            plt.show()
+            plt.close()
+
+    def scatter_plot_observed_speed_count_by_link(self, link_list, fig_name='link_obs_speed_count_scatterplot_pathflow_by_link'):
+         if self.dode.config['use_car_link_flow'] + self.dode.config['use_truck_link_flow'] + self.dode.config['use_car_link_tt'] + self.dode.config['use_truck_link_tt']:
+            if link_list is None:
+                link_list = self.dode.observed_links
+            if self.dode.config['use_car_link_flow']:
+                true_car_count = self.true_car_count.reshape(self.dode.num_assign_interval, -1) 
+                estimated_car_count = self.estimated_car_count.reshape(self.dode.num_assign_interval, -1) 
+            if self.dode.config['use_truck_link_flow']:
+                true_truck_count = self.true_truck_count.reshape(self.dode.num_assign_interval, -1) 
+                estimated_truck_count = self.estimated_truck_count.reshape(self.dode.num_assign_interval, -1) 
+            if self.dode.config['use_car_link_tt']:
+                true_car_speed = self.true_car_speed.reshape(self.dode.num_assign_interval, -1) 
+                estimated_car_speed = self.estimated_car_speed.reshape(self.dode.num_assign_interval, -1) 
+            if self.dode.config['use_truck_link_tt']:
+                true_truck_speed = self.true_truck_speed.reshape(self.dode.num_assign_interval, -1) 
+                estimated_truck_speed = self.estimated_truck_speed.reshape(self.dode.num_assign_interval, -1) 
+
+            n = 2
+            n_actual = 0
+            for li, link in enumerate(link_list):
+                if np.sum(np.array(self.observed_link_list) == link) == 0:
+                    print("Link {} is not in the observed link list.".format(link))
+                    continue
+                fig, axes = plt.subplots(1, n, figsize=(9*n, 9), dpi=300, squeeze=False)
+                i = 0
+
+                if self.dode.config['use_car_link_flow'] and self.dode.config['use_car_link_tt']:
+                    link_true_car_count = true_car_count[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_car_count = estimated_car_count[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    ind_count = ~(np.isinf(link_true_car_count) + np.isinf(link_estimated_car_count) + np.isnan(link_true_car_count) + np.isnan(link_estimated_car_count))
+                    m_car_max = int(np.max((np.max(link_true_car_count[ind_count]), np.max(link_estimated_car_count[ind_count]))) + 1) if any(ind_count) else 20
+                    
+                    
+                    link_true_car_speed = true_car_speed[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_car_speed = estimated_car_speed[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    ind_speed = ~(np.isinf(link_true_car_speed) + np.isinf(link_estimated_car_speed) + np.isnan(link_true_car_speed) + np.isnan(link_estimated_car_speed))
+                    if sum(ind_speed) > 0:
+                        car_speed_min = np.min((np.min(link_true_car_speed[ind_speed]), np.min(link_estimated_car_speed[ind_speed]))) - 1
+                        car_speed_max = np.max((np.max(link_true_car_speed[ind_speed]), np.max(link_estimated_car_speed[ind_speed]))) + 1
+                        axes[0, i].scatter(link_true_car_count[ind_count & ind_speed], link_true_car_speed[ind_count & ind_speed], marker = self.marker_list[i], s = 100, color = 'green', label = 'Observed')
+                        axes[0, i].scatter(link_estimated_car_count[ind_count & ind_speed], link_estimated_car_speed[ind_count & ind_speed], marker = self.marker_list[i], s = 100, color = 'red', label = 'Estimated')
+                        axes[0, i].set_ylabel('True observed link speed for car')
+                        axes[0, i].set_xlabel('True observed link count for car (veh/15 min)')
+                        axes[0, i].set_xlim([0, m_car_max])
+                        axes[0, i].set_ylim([car_speed_min, car_speed_max])
+                        axes[0, i].legend()
+                        # axes[0, i].set_box_aspect(1)
+                        n_actual += 1
+                    else:
+                        print(f"No valid data for link {link} for car speed and count.")
+
+                i += (self.dode.config['use_car_link_flow'] & self.dode.config['use_car_link_tt'])
+
+                if self.dode.config['use_truck_link_flow'] and self.dode.config['use_truck_link_tt']:
+                    link_true_truck_count = true_truck_count[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_truck_count = estimated_truck_count[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    ind_count = ~(np.isinf(link_true_truck_count) + np.isinf(link_estimated_truck_count) + np.isnan(link_true_truck_count) + np.isnan(link_estimated_truck_count))
+                    m_truck_max = int(np.max((np.max(link_true_truck_count[ind_count]), np.max(link_estimated_truck_count[ind_count]))) + 1) if any(ind_count) else 20
+                    
+                    link_true_truck_speed = true_truck_speed[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    link_estimated_truck_speed = estimated_truck_speed[:, np.where(np.array(self.observed_link_list) == link)[0][0]]
+                    ind_speed = ~(np.isinf(link_true_truck_speed) + np.isinf(link_estimated_truck_speed) + np.isnan(link_true_truck_speed) + np.isnan(link_estimated_truck_speed))
+                    if sum(ind_speed) > 0:
+                        truck_speed_min = np.min((np.min(link_true_truck_speed[ind_speed]), np.min(link_estimated_truck_speed[ind_speed]))) - 1
+                        truck_speed_max = np.max((np.max(link_true_truck_speed[ind_speed]), np.max(link_estimated_truck_speed[ind_speed]))) + 1
+                        axes[0, i].scatter(link_true_truck_count[ind_count & ind_speed], link_true_truck_speed[ind_count & ind_speed], marker = self.marker_list[i], s = 100, color = 'green', label = 'Observed')
+                        axes[0, i].scatter(link_estimated_truck_count[ind_count & ind_speed], link_estimated_truck_speed[ind_count & ind_speed], marker = self.marker_list[i], s = 100, color = 'red', label = 'Estimated')
+                        axes[0, i].set_ylabel('True observed link speed for truck')
+                        axes[0, i].set_xlabel('True observed link count for truck (veh/15 min)')
+                        axes[0, i].set_xlim([0, m_truck_max])
+                        axes[0, i].set_ylim([truck_speed_min, truck_speed_max])
+                        axes[0, i].legend()
+                        # axes[0, i].set_box_aspect(1)
+                        n_actual += 1
+                    else:
+                        print(f"No valid data for link {link} for truck speed.")                       
+
+                if n_actual > 0:
+                    plt.savefig(os.path.join(self.result_folder, fig_name + "_{}.png".format(link)), bbox_inches='tight')
+
+                    plt.show()
+                    plt.close()
 
 # def r2_score(y_true, y_pred):
 #     # Check if inputs are numpy arrays, if not, convert them
