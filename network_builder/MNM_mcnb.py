@@ -189,14 +189,26 @@ class MNM_demand():
     def __repr__(self):
         return self.__str__()
 
+    # def generate_text(self):
+    #     # generate OD demand in text
+    #     tmp_str = '#Origin_ID Destination_ID <car demand by interval> <truck demand by interval>\n'
+    #     for O in self.demand_dict.keys():
+    #         for D in self.demand_dict[O].keys():
+    #             tmp_str += ' '.join([str(e) for e in [O, D] +
+    #                                  self.demand_dict[O][D][0].tolist() + self.demand_dict[O][D][1].tolist()]) + '\n'
+    #     return tmp_str
+    
     def generate_text(self):
-        # generate OD demand in text
-        tmp_str = '#Origin_ID Destination_ID <car demand by interval> <truck demand by interval>\n'
-        for O in self.demand_dict.keys():
-            for D in self.demand_dict[O].keys():
-                tmp_str += ' '.join([str(e) for e in [O, D] +
-                                     self.demand_dict[O][D][0].tolist() + self.demand_dict[O][D][1].tolist()]) + '\n'
-        return tmp_str
+        lines = ['#Origin_ID Destination_ID <car demand by interval> <truck demand by interval>']
+        for O, d_dict in self.demand_dict.items():
+            for D, (car_demand, truck_demand) in d_dict.items():
+                lines.append(
+                    f"{O} {D} "
+                    + ' '.join(map(str, car_demand))
+                    + ' '
+                    + ' '.join(map(str, truck_demand))
+                )
+        return '\n'.join(lines) + '\n'
 
 
 class MNM_od():
@@ -438,8 +450,8 @@ class MNM_path():
     def generate_portion_text(self):
         assert(self.route_portions is not None)
         assert(self.truck_route_portions is not None)
-        return ' '.join([str(e) for e in np.append(self.route_portions, self.truck_route_portions)])
-
+        # return ' '.join([str(e) for e in np.append(self.route_portions, self.truck_route_portions)])
+        return ' '.join(map(str, self.route_portions)) + ' ' + ' '.join(map(str, self.truck_route_portions))
 
 class MNM_pathset():
     # path set for one OD pair: a list of paths
@@ -581,32 +593,41 @@ class MNM_pathtable():
     def __repr__(self):
         return self.__str__()
 
-    def generate_table_text(self):
-        tmp_str = ""
-        # python 2
-        # for path_ID, path in self.ID2path.iteritems():
-        # python 3
-        for path_ID, path in self.ID2path.items():
-            tmp_str += path.generate_node_list_text() + '\n'
-        return tmp_str
+    # def generate_table_text(self):
+    #     tmp_str = ""
+    #     # python 2
+    #     # for path_ID, path in self.ID2path.iteritems():
+    #     # python 3
+    #     for path_ID, path in self.ID2path.items():
+    #         tmp_str += path.generate_node_list_text() + '\n'
+    #     return tmp_str
     
+    # def generate_table_text_link_seq(self):
+    #     tmp_str = ""
+    #     # python 2
+    #     # for path_ID, path in self.ID2path.iteritems():
+    #     # python 3
+    #     for path_ID, path in self.ID2path.items():
+    #         tmp_str += path.generate_link_list_text() + '\n'
+    #     return tmp_str
+
+    # def generate_portion_text(self):
+    #     tmp_str = ""
+    #     # python 2
+    #     # for path_ID, path in self.ID2path.iteritems():
+    #     # python 3
+    #     for path_ID, path in self.ID2path.items():
+    #         tmp_str += path.generate_portion_text() + '\n'
+    #     return tmp_str
+
+    def generate_table_text(self):
+        return '\n'.join(path.generate_node_list_text() for path in self.ID2path.values()) + '\n'
+
     def generate_table_text_link_seq(self):
-        tmp_str = ""
-        # python 2
-        # for path_ID, path in self.ID2path.iteritems():
-        # python 3
-        for path_ID, path in self.ID2path.items():
-            tmp_str += path.generate_link_list_text() + '\n'
-        return tmp_str
+        return '\n'.join(path.generate_link_list_text() for path in self.ID2path.values()) + '\n'
 
     def generate_portion_text(self):
-        tmp_str = ""
-        # python 2
-        # for path_ID, path in self.ID2path.iteritems():
-        # python 3
-        for path_ID, path in self.ID2path.items():
-            tmp_str += path.generate_portion_text() + '\n'
-        return tmp_str
+        return '\n'.join(path.generate_portion_text() for path in self.ID2path.values()) + '\n'
 
 # class MNM_routing():
 #   def __init__(self):
@@ -1149,6 +1170,58 @@ class MNM_network_builder():
                     sum_to_OD=True)
                 self.demand.add_demand(
                     O, D, demand, truck_demand, overwriting=True)
+        self.route_choice_flag = True
+
+    def _build_od_path_cache(self):
+        # Precompute mapping: (O_node, D_node) -> (col_indices, path_list, O, D)
+        # col_indices is a numpy int array giving each path's column position in the
+        # (max_interval x total_paths) flow matrix used by update_demand_path3.
+        path_id_to_col = {path_ID: i for i, path_ID in enumerate(self.path_table.ID2path.keys())}
+        cache = {}
+        for O_node, d_dict in self.path_table.path_dict.items():
+            O = self.od.O_dict.inv[O_node]
+            for D_node, pathset in d_dict.items():
+                D = self.od.D_dict.inv[D_node]
+                col_indices = np.array(
+                    [path_id_to_col[p.path_ID] for p in pathset.path_list], dtype=np.intp)
+                cache[(O_node, D_node)] = (col_indices, pathset.path_list, O, D)
+        self._od_path_cache = cache
+
+    def update_demand_path3(self, car_flow, truck_flow):
+        # Optimized version of update_demand_path2.
+        # Avoids per-path Python loops for normalization by using NumPy fancy indexing
+        # on OD-grouped column slices. A one-time OD cache is built and reused across calls.
+        assert (len(car_flow) == len(self.path_table.ID2path) *
+                self.config.config_dict['DTA']['max_interval'])
+        assert (len(truck_flow) == len(self.path_table.ID2path) *
+                self.config.config_dict['DTA']['max_interval'])
+        T = self.config.config_dict['DTA']['max_interval']
+        P = len(self.path_table.ID2path)
+
+        car_flow   = car_flow.reshape(T, P)
+        truck_flow = truck_flow.reshape(T, P)
+
+        if not hasattr(self, '_od_path_cache'):
+            self._build_od_path_cache()
+
+        self.demand.demand_dict = {}
+        for (od_cols, od_paths, O, D) in self._od_path_cache.values():
+            # Gather columns for this OD pair and compute normalized portions + OD demand
+            car_od   = car_flow[:, od_cols]                                    # (T, N_od)
+            car_sum  = car_od.sum(axis=1)                                      # (T,)
+            car_norm = car_od / np.maximum(car_sum[:, np.newaxis], 1e-6)       # (T, N_od)
+
+            truck_od   = truck_flow[:, od_cols]
+            truck_sum  = truck_od.sum(axis=1)
+            truck_norm = truck_od / np.maximum(truck_sum[:, np.newaxis], 1e-6)
+
+            # Write normalized portions back to path objects (pointer assignments only)
+            for j, path in enumerate(od_paths):
+                path.route_portions       = car_norm[:, j]
+                path.truck_route_portions = truck_norm[:, j]
+
+            self.demand.demand_dict.setdefault(O, {})[D] = [car_sum, truck_sum]
+
         self.route_choice_flag = True
 
     # def get_path_flow(self):

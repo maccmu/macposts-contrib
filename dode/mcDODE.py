@@ -128,8 +128,8 @@ class torch_pathflow_solver(nn.Module):
                 (log_f_car, log_f_truck) = pickle.load(open(use_file_as_init, 'rb'))
                 assert(np.all(log_f_car >= 0) and np.all(log_f_truck >= 0))
                 # inverse of softplus, default threshold of nn.Softplus is 20
-                log_f_car = np.where(np.log(np.exp(log_f_car) - 1) < 20., np.log(np.exp(log_f_car) - 1), log_f_car)
-                log_f_truck = np.where(np.log(np.exp(log_f_truck) - 1) < 20., np.log(np.exp(log_f_truck) - 1), log_f_truck)
+                log_f_car = np.where(log_f_car < 20., np.log(np.expm1(np.clip(log_f_car, 1e-10, 500.))), log_f_car)
+                log_f_truck = np.where(log_f_truck < 20., np.log(np.expm1(np.clip(log_f_truck, 1e-10, 500.))), log_f_truck)
                 self.car_scale, self.truck_scale = 1., 1.
             else:
                 # log f numpy
@@ -351,7 +351,8 @@ class MCDODE():
 
         # modify demand based on input path flows
         if (f_car is not None) and (f_truck is not None):
-            self.nb.update_demand_path2(f_car, f_truck)
+            # self.nb.update_demand_path2(f_car, f_truck)
+            self.nb.update_demand_path3(f_car, f_truck)
    
         # self.nb.config.config_dict['DTA']['flow_scalar'] = 3
         if self.config['use_car_link_tt'] or self.config['use_truck_link_tt']:
@@ -431,7 +432,7 @@ class MCDODE():
         return a
 
     def get_dar3(self, dta, f_car, f_truck, engine='pyarrow'):
-
+        car_dar, truck_dar = None, None
         if self.config['use_car_link_flow'] or self.config['use_car_link_tt']:
             # (num_assign_timesteps x num_links x num_path x num_assign_timesteps) x 5
             file_name = os.path.join(self.nb.folder_path, 'record', 'car_dar_matrix.txt')
@@ -731,32 +732,42 @@ class MCDODE():
         one_data_dict = self._get_one_data(0)
 
         m_car = one_data_dict['car_link_flow']
-        m_truck = one_data_dict['truck_link_flow']
+        if self.config['use_truck_link_flow']:
+            m_truck = one_data_dict['truck_link_flow']
         # link_mask = one_data_dict['mask_driving_link'][:num_links]
         
         m_car = m_car.reshape(-1, num_links) 
-        m_truck = m_truck.reshape(-1, num_links) 
+        if self.config['use_truck_link_flow']:
+            m_truck = m_truck.reshape(-1, num_links) 
 
         # m_car_avg = np.nanmedian(m_car, axis=0, keepdims=True)
         # m_truck_avg = np.nanmedian(m_truck, axis=0, keepdims=True)
 
         m_car_avg = np.nanmax(m_car, axis=0, keepdims=True)
-        m_truck_avg = np.nanmax(m_truck, axis=0, keepdims=True)
+        if self.config['use_truck_link_flow']:
+            m_truck_avg = np.nanmax(m_truck, axis=0, keepdims=True)
 
         car_scale = link_coverage.astype(float)/link_coverage.sum(axis=0, keepdims=True)*m_car_avg
-        truck_scale = link_coverage.astype(float)/link_coverage.sum(axis=0, keepdims=True)*m_truck_avg
+        if self.config['use_truck_link_flow']:
+            truck_scale = link_coverage.astype(float)/link_coverage.sum(axis=0, keepdims=True)*m_truck_avg
 
         car_scale = np.nanmax(car_scale, axis=1)
-        truck_scale = np.nanmax(truck_scale, axis=1)
+        if self.config['use_truck_link_flow']:
+            truck_scale = np.nanmax(truck_scale, axis=1)
 
         car_scale = np.nan_to_num(car_scale)
-        truck_scale = np.nan_to_num(truck_scale)
+        if self.config['use_truck_link_flow']:
+            truck_scale = np.nan_to_num(truck_scale)
 
         car_scale = np.maximum(car_scale, 1.2)
-        truck_scale = np.maximum(truck_scale, 1.2)
+        if self.config['use_truck_link_flow']:
+            truck_scale = np.maximum(truck_scale, 1.2)
 
         car_scale = car_scale / self.nb.config.config_dict['DTA']['flow_scalar'] 
-        truck_scale = truck_scale / self.nb.config.config_dict['DTA']['flow_scalar'] 
+        if self.config['use_truck_link_flow']:
+            truck_scale = truck_scale / self.nb.config.config_dict['DTA']['flow_scalar'] 
+        else:
+            truck_scale = 0.
 
         return car_scale, truck_scale
 
@@ -802,9 +813,16 @@ class MCDODE():
         if self.config['use_truck_link_flow']:
             grad, x_e_truck = self._compute_count_loss_grad_on_truck_link_flow(dta, one_data_dict)
             truck_grad += self.config['link_truck_flow_weight'] * grad
-
-        f_car_grad = car_dar.T.dot(car_grad)
-        f_truck_grad = truck_dar.T.dot(truck_grad)
+        
+        if self.config['use_car_link_flow']:
+            f_car_grad = car_dar.T.dot(car_grad)
+        else:
+            f_car_grad = np.zeros_like(f_car)
+            
+        if self.config['use_truck_link_flow']:
+            f_truck_grad = truck_dar.T.dot(truck_grad)
+        else:
+            f_truck_grad = np.zeros_like(f_truck)
 
         # Travel time
         car_grad = np.zeros(len(self.observed_links) * self.num_assign_interval)
@@ -1663,6 +1681,13 @@ class MCDODE():
                 f_car_grad, f_truck_grad = 0, 0
                 pathflow_solver.optimizer.zero_grad()
 
+                if torch.any(~torch.isfinite(pathflow_solver.log_f_car)) or torch.any(~torch.isfinite(pathflow_solver.log_f_truck)):
+                    # softplus(-23) ≈ 1e-10, softplus(23) ≈ 23
+                    torch.nan_to_num_(pathflow_solver.log_f_car.data, nan=-23., neginf=-23.)
+                    torch.nan_to_num_(pathflow_solver.log_f_truck.data, nan=-23., neginf=-23.)
+                    pathflow_solver.set_params_with_lr(car_step_size, truck_step_size)
+                    pathflow_solver.set_optimizer(algo)
+
                 # f tensor
                 f_car, f_truck = pathflow_solver.generate_pathflow_tensor()
 
@@ -1867,11 +1892,13 @@ class MCDODE():
                     self.update_path_table(dta)
                     f_car, f_truck = self.update_path_flow(f_car, f_truck, car_init_scale, truck_init_scale)
                     dta = 0
-            
+
+                f_car = np.nan_to_num(f_car, nan=0.)
+                f_truck = np.nan_to_num(f_truck, nan=0.)
                 f_car = np.maximum(f_car, 1e-6)
                 f_truck = np.maximum(f_truck, 1e-6)
 
-                if column_generation[i]:
+                if column_generation[i] or np.any(np.isnan(f_car_tensor.data.cpu().numpy())) or np.any(np.isnan(f_truck_tensor.data.cpu().numpy())):
                     if normalized_by_scale:
                         f_car_tensor = torch.from_numpy(f_car / np.maximum(car_init_scale, 1e-6))
                         f_truck_tensor = torch.from_numpy(f_truck / np.maximum(truck_init_scale, 1e-6))
