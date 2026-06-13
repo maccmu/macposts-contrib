@@ -13,6 +13,13 @@ Currently this repository contains two sub-projects:
 If some of those scripts are proved to be useful, we may consider to add them to
 the core macposts library.
 
+## Getting started
+
+These scripts target Python 3 and build on [macposts] plus several scientific
+Python packages. Install the dependencies with:
+
+    pip install -r requirements.txt
+
 ## Acknowledgment
 
 This project is funded in part by Traffic 21 Institute, Carnegie Mellon

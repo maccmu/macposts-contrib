@@ -1,0 +1,11 @@
+bidict
+macposts
+matplotlib
+networkx
+numpy
+pandarallel
+pandas
+scikit-learn
+scipy
+seaborn
+torch
