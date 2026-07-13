@@ -795,7 +795,7 @@ class MNM_network_builder():
     
     def get_link_coverage(self, link_list, path, graph_file_name='Snap_graph', pathtable_file_name='path_table', pathtable_link_seq_file_name='path_table_link_seq'):
         graph = pd.read_csv(os.path.join(path, graph_file_name), sep=' ', skiprows=1, header=None)
-        if os.path.isfile(path, pathtable_link_seq_file_name):
+        if os.path.isfile(os.path.join(path, pathtable_link_seq_file_name)):
             f = open(os.path.join(path, pathtable_link_seq_file_name), 'r')
             path_table = f.readlines()
             f.close()
