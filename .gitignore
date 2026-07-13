@@ -6,3 +6,13 @@ __pycache__/
 .DS_Store
 *.patch
 *.diff
+# Local agent/session artifacts
+.vscode/
+TODO.md
+AGENTS.md
+CLAUDE.md
+.ai_context.md
+CONTEXT.md
+/.claude/
+/.ai_agent/
+/docs/
